@@ -8,7 +8,7 @@ const { Pool } = pkg;
 // ====== PostgreSQL Pool (Neon用) ======
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // NeonはSSL必須
+  ssl: { rejectUnauthorized: false } // Neon は SSL 必須
 });
 
 // ====== DB操作関数 ======
@@ -49,7 +49,7 @@ const userWordCounts = {};
 const renameMap = new Map();
 const WORDS = { kiremono: 'きれもの', ritaiya: 'りたいあ', kirenashi: 'きれなし' };
 const randomReplies = [
-  '窓をお開け！全部だよ！！', 
+  '窓をお開け！全部だよ！！',
   'やはり！さぁ、きばるんだよ！',
   'んん……？？',
   'あぁああごめんごめん、いい子でおねんねしてたのにねぇ。ばぁばはまだお仕事があるの。いいこでおねんねしててねぇ～。',
@@ -63,7 +63,7 @@ const randomReplies = [
   'フン！',
 ];
 
-// ready → clientReady に変更
+// clientReady に変更
 client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
