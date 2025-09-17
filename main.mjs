@@ -5,13 +5,13 @@ import pkg from 'pg';
 
 const { Pool } = pkg;
 
-// ----- PostgreSQL Pool -----
+// ====== PostgreSQL Pool (Neon用) ======
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // NeonはSSL必須
+  ssl: { rejectUnauthorized: false }, // NeonはSSL必須
 });
 
-// ---- DB操作 ----
+// ====== DB操作関数 ======
 async function saveCount(userId, counts) {
   await pool.query(
     `INSERT INTO counts (user_id, kiremono, ritaiya, kirenashi, nickname_changes)
@@ -24,8 +24,7 @@ async function saveCount(userId, counts) {
 
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
-  if (rows.length === 0)
-    return { kiremono: 0, ritaiya: 0, kirenashi: 0, nicknameChanges: 0 };
+  if (rows.length === 0) return { kiremono:0, ritaiya:0, kirenashi:0, nicknameChanges:0 };
   const r = rows[0];
   return {
     kiremono: r.kiremono,
@@ -35,7 +34,7 @@ async function loadCount(userId) {
   };
 }
 
-// ---- Discord Bot ----
+// ====== Discord Bot 設定 ======
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -45,9 +44,7 @@ const client = new Client({
   ],
 });
 
-const GUILD_ID = process.env.GUILD_ID;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
-
 const userWordCounts = {};
 const renameMap = new Map();
 const WORDS = { kiremono: 'きれもの', ritaiya: 'りたいあ', kirenashi: 'きれなし' };
@@ -66,26 +63,26 @@ const randomReplies = [
   'フン！',
 ];
 
+// ready → clientReady に変更
 client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
+// メッセージ監視
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (message.channel.id !== TARGET_CHANNEL_ID) return;
 
   const uid = message.author.id;
 
-  if (!userWordCounts[uid]) {
-    userWordCounts[uid] = await loadCount(uid);
-  }
+  if (!userWordCounts[uid]) userWordCounts[uid] = await loadCount(uid);
 
   // --- ニックネーム変更 ---
   if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
     const member = message.member;
     if (!member) return;
     const oldNick = member.nickname || member.user.username;
-    const percent = Math.floor(Math.random() * 121); // 0～120
+    const percent = Math.floor(Math.random()*121);
     const newNick = `切れ者確率${percent}%`;
 
     renameMap.set(member.id, oldNick);
@@ -94,7 +91,7 @@ client.on('messageCreate', async (message) => {
 
     await member.setNickname(newNick).catch(console.error);
     await message.channel.send(
-      `**お前は${userWordCounts[uid].nicknameChanges}回目の入浴だねぇ。**\n\n` +
+      `**お前は${userWordCounts[uid].nicknameChanges}回目の入浴だねぇ。**\n` +
       `**フン。ようやく準備ができたのかい。\n${oldNick}というのかい。贅沢な名だねぇ。\n` +
       `今からお前の名は${newNick} だ。\nいいかい？${newNick}だ。\n` +
       `分かったら返事をするんだ、${newNick}！！**`
@@ -108,13 +105,11 @@ client.on('messageCreate', async (message) => {
     const oldNick = renameMap.get(uid);
     await member.setNickname(oldNick).catch(console.error);
     renameMap.delete(uid);
-    await message.channel.send(
-      '**それがお前の答えかい？\nいきな！\nお前の勝ちだ！\n早くいっちまいな！！\nフン！**'
-    );
+    await message.channel.send('**それがお前の答えかい？\nいきな！\nお前の勝ちだ！\n早くいっちまいな！！\nフン！**');
     return;
   }
 
-  // --- ワード集計 & カウント付き返信 ---
+  // --- ワード集計 ---
   let matchedWord = null;
   for (const [key, word] of Object.entries(WORDS)) {
     if (message.content.includes(word)) {
@@ -155,10 +150,11 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// Discord Bot ログイン
 client.login(process.env.DISCORD_TOKEN);
 
-// ====== Render用 ダミーHTTPサーバー ======
+// ===== Render用 ダミーHTTPサーバー =====
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (_, res) => { res.send('Discord bot is running!'); });
-app.listen(PORT, () => { console.log(`🌐 Dummy HTTP server listening on port ${PORT}`); });
+app.get('/', (_, res) => res.send('Discord bot is running!'));
+app.listen(PORT, () => console.log(`🌐 Dummy HTTP server listening on port ${PORT}`));
