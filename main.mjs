@@ -4,9 +4,11 @@ import express from 'express';
 import pkg from 'pg';
 
 const { Pool } = pkg;
+
+// ----- PostgreSQL Pool -----
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // NeonはSSL必須
+  ssl: { rejectUnauthorized: false } // NeonはSSL必須
 });
 
 // ---- DB操作 ----
@@ -19,6 +21,7 @@ async function saveCount(userId, counts) {
     [userId, counts.kiremono, counts.ritaiya, counts.kirenashi, counts.nicknameChanges]
   );
 }
+
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
   if (rows.length === 0)
@@ -45,8 +48,8 @@ const client = new Client({
 const GUILD_ID = process.env.GUILD_ID;
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 
-const userWordCounts = {};           // キャッシュ
-const renameMap = new Map();         // { userId: oldNickname }
+const userWordCounts = {};
+const renameMap = new Map();
 const WORDS = { kiremono: 'きれもの', ritaiya: 'りたいあ', kirenashi: 'きれなし' };
 const randomReplies = [
   '窓をお開け！全部だよ！！', 
@@ -63,7 +66,7 @@ const randomReplies = [
   'フン！',
 ];
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
@@ -73,7 +76,6 @@ client.on('messageCreate', async (message) => {
 
   const uid = message.author.id;
 
-  // DBから初期値を取得（キャッシュが無い場合のみ）
   if (!userWordCounts[uid]) {
     userWordCounts[uid] = await loadCount(uid);
   }
