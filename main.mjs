@@ -1,10 +1,9 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import pkg from 'pg';
-import express from 'express'; // ← 追加
 const { Pool } = pkg;
 
-// ==== Discord Client ====
+// ==== Bot初期化 ====
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -16,10 +15,9 @@ const client = new Client({
 
 // ==== 環境変数 ====
 const COUNT_CHANNEL_ID = process.env.COUNT_CHANNEL_ID;
-const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
-const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
 const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
-const PORT = process.env.PORT || 10000; // Render がチェックするポート
+const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
+const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
 // ==== Neon/PostgreSQL ====
 const pool = new Pool({
@@ -66,7 +64,7 @@ async function resetAllCounts() {
 }
 
 // ==== ボタン管理 ====
-const userButtonMessages = new Map(); // ユーザー専用ボタン
+const userButtonMessages = new Map();
 
 function createButtonRow(userCounts) {
   const row = new ActionRowBuilder();
@@ -109,56 +107,62 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const member = message.member;
 
-  // ニックネーム変更・復帰は特定チャンネルのみ
-  if (![NICKNAME_CHANNEL_ID, AUTO_DELETE_CHANNEL_ID, COUNT_CHANNEL_ID].includes(message.channel.id)) return;
+  // ニックネーム変更チャンネルのみ
+  if (message.channel.id === NICKNAME_CHANNEL_ID) {
+    // ニックネーム変更トリガー
+    if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
+      const oldNick = member.nickname || member.user.username;
+      const counts = await loadCount(member.id);
+      counts.nickname_changes += 1;
+      const percent = Math.floor(Math.random() * 121);
+      const newNick = `切れ者確率${percent}%`;
+      await member.setNickname(newNick).catch(console.error);
 
-  // ニックネーム変更
-  if (message.channel.id === NICKNAME_CHANNEL_ID && message.mentions.has(client.user) && message.content.includes('切れ者')) {
-    const oldNick = member.nickname || member.user.username;
-    let userCounts = await loadCount(member.id);
-    userCounts.nickname_changes = (userCounts.nickname_changes || 0) + 1;
-    const newNick = `切れ者確率${Math.floor(Math.random() * 121)}%`;
-    await member.setNickname(newNick).catch(console.error);
+      await saveCount(member.id, counts);
 
-    await saveCount(member.id, userCounts);
+      await message.channel.send(
+        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\nフン。ようやく準備ができたのかい。\n変更前のニックネームというのかい。贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\nいいかい？切れ者確率${percent}%だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
+      );
 
-    await message.channel.send(
-      `**お前は${userCounts.nickname_changes}回目の入浴だねぇ。\nフン。ようやく準備ができたのかい。\n変更前のニックネームというのかい。贅沢な名だねぇ。\n今からお前の名は${newNick}だ。\nいいかい？${newNick}だ。\n分かったら返事をするんだ、${newNick}！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
-    );
-
-    await sendOrUpdateButtons(message.channel, member.id, userCounts);
-    return;
-  }
-
-  // バルス（全員リセット）
-  if (message.channel.id === COUNT_CHANNEL_ID && message.mentions.has(client.user) && message.content.includes('バルス')) {
-    await resetAllCounts();
-    for (const [userId, _] of userButtonMessages.entries()) {
-      await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
+      const userCounts = await loadCount(member.id);
+      await sendOrUpdateButtons(message.channel, member.id, userCounts);
+      return;
     }
-    await message.channel.send('**全員の集計をリセットしました！**');
-    return;
-  }
 
-  // ニックネーム復帰
-  if (message.channel.id === NICKNAME_CHANNEL_ID && message.attachments.size > 0) {
-    const oldNick = member.nickname?.match(/切れ者確率\d+%/) ? member.user.username : member.nickname;
-    if (oldNick) {
-      await member.setNickname(oldNick).catch(console.error);
-      await message.channel.send('**それがお前の答えかい？\nいきな！\nお前の勝ちだ！\n早くいっちまいな！！\nフン！**');
-      if (userButtonMessages.has(member.id)) {
-        await userButtonMessages.get(member.id).delete().catch(console.error);
-        userButtonMessages.delete(member.id);
+    // ニックネーム復帰（画像投稿）
+    if (message.attachments.size > 0) {
+      const oldNick = member.nickname?.match(/切れ者確率\d+%/) ? member.user.username : member.nickname;
+      if (oldNick) {
+        await member.setNickname(oldNick).catch(console.error);
+        await message.channel.send(
+          '**それがお前の答えかい？\nいきな！\nお前の勝ちだ！\n早くいっちまいな！！\nフン！**'
+        );
+
+        // ボタン非表示
+        if (userButtonMessages.has(member.id)) {
+          await userButtonMessages.get(member.id).delete().catch(console.error);
+          userButtonMessages.delete(member.id);
+        }
       }
     }
   }
 
-  // 自動削除（24時間後）
+  // バルスコマンド（COUNT_CHANNEL_ID）
+  if (message.channel.id === COUNT_CHANNEL_ID) {
+    if (message.mentions.has(client.user) && message.content.includes('バルス')) {
+      await resetAllCounts();
+      for (const [userId, _] of userButtonMessages.entries()) {
+        await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
+      }
+      await message.channel.send('**全員の集計をリセットしました！**');
+      return;
+    }
+  }
+
+  // 自動削除（AUTO_DELETE_CHANNEL_ID）
   if (message.channel.id === AUTO_DELETE_CHANNEL_ID) {
     setTimeout(async () => {
-      if (!message.deleted) {
-        await message.delete().catch(console.error);
-      }
+      if (!message.deleted) await message.delete().catch(console.error);
     }, 24 * 60 * 60 * 1000);
   }
 });
@@ -175,7 +179,7 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  let userCounts = await loadCount(userId);
+  const userCounts = await loadCount(userId);
   userCounts[key] += 1;
   await saveCount(userId, userCounts);
 
@@ -184,11 +188,6 @@ client.on('interactionCreate', async interaction => {
   const reply = randomReplies[Math.floor(Math.random() * randomReplies.length)];
   await interaction.reply({ content: `**${BUTTON_LABELS[key]} ${userCounts[key]}回目！ ${reply}**`, ephemeral: true });
 });
-
-// ==== Render 用ダミー Web サーバー ====
-const app = express();
-app.get('/', (req, res) => res.send('Bot is running!'));
-app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
 
 // ==== Botログイン ====
 client.login(process.env.DISCORD_TOKEN);
