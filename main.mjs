@@ -14,9 +14,9 @@ const client = new Client({
 
 // ==== 環境変数 ====
 const COUNT_CHANNEL_ID = process.env.COUNT_CHANNEL_ID;
-const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
-const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
 const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
+const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
+const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
 // ==== Neon/PostgreSQL ====
 const pool = new Pool({
@@ -59,7 +59,35 @@ async function saveCount(userId, counts) {
 }
 
 async function resetAllCounts() {
-  await pool.query('UPDATE counts SET kiremono=0, ritaiya=0, kirenashi=0, nickname_changes=0');
+  await pool.query('UPDATE counts SET kiremono=0, ritaiya=0, kirenashi=0');
+}
+
+// ==== 自動削除用 DB ====
+async function scheduleMessageDeletion(message) {
+  const deleteAt = new Date(Date.now() + 24*60*60*1000); // 24時間後
+  await pool.query(
+    `INSERT INTO messages_to_delete(message_id, channel_id, user_id, delete_at)
+     VALUES($1,$2,$3,$4) ON CONFLICT(message_id) DO NOTHING`,
+    [message.id, message.channel.id, message.author.id, deleteAt]
+  );
+}
+
+async function processScheduledDeletions() {
+  const now = new Date();
+  const { rows } = await pool.query(`SELECT * FROM messages_to_delete WHERE delete_at <= $1`, [now]);
+
+  for (const row of rows) {
+    try {
+      const channel = await client.channels.fetch(row.channel_id);
+      if (channel && channel.isTextBased()) {
+        const msg = await channel.messages.fetch(row.message_id).catch(() => null);
+        if (msg) await msg.delete().catch(() => null);
+      }
+    } catch (err) {
+      console.error('削除エラー:', err);
+    }
+    await pool.query(`DELETE FROM messages_to_delete WHERE message_id=$1`, [row.message_id]);
+  }
 }
 
 // ==== ボタン管理 ====
@@ -75,15 +103,6 @@ function createButtonRow(userCounts) {
         .setStyle(ButtonStyle.Primary)
     );
   });
-
-  // ユーザー専用リセットボタン
-  row.addComponents(
-    new ButtonBuilder()
-      .setCustomId('reset_self')
-      .setLabel('自分のカウントをリセット')
-      .setStyle(ButtonStyle.Danger)
-  );
-
   return row;
 }
 
@@ -100,6 +119,7 @@ async function sendOrUpdateButtons(channel, userId, userCounts) {
 // ==== Bot起動 ====
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  setInterval(processScheduledDeletions, 60*1000); // 1分ごとに自動削除チェック
 });
 
 // ==== 自動ロール付与 ====
@@ -115,42 +135,32 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const member = message.member;
 
-  // 特定チャンネルのみ処理
-  if (![NICKNAME_CHANNEL_ID, AUTO_DELETE_CHANNEL_ID, COUNT_CHANNEL_ID].includes(message.channel.id)) return;
+  // 自動削除対象チャンネル
+  if (message.channel.id === AUTO_DELETE_CHANNEL_ID) {
+    await scheduleMessageDeletion(message);
+  }
 
   // ニックネーム変更トリガー
   if (message.channel.id === NICKNAME_CHANNEL_ID && message.mentions.has(client.user) && message.content.includes('切れ者')) {
     const oldNick = member.nickname || member.user.username;
-    let userCounts = await loadCount(member.id);
-
-    // ニックネーム変更回数をインクリメント
-    userCounts.nickname_changes += 1;
-    await saveCount(member.id, userCounts);
-
-    const percent = Math.floor(Math.random() * 121);
+    const counts = await loadCount(member.id);
+    counts.nickname_changes += 1;
+    const percent = Math.floor(Math.random()*121);
     const newNick = `切れ者確率${percent}%`;
     await member.setNickname(newNick).catch(console.error);
 
-    const reply = randomReplies[Math.floor(Math.random()*randomReplies.length)];
+    await saveCount(member.id, counts);
+
     await message.channel.send(
-      `**お前は${userCounts.nickname_changes}回目の入浴だねぇ。\nフン。ようやく準備ができたのかい。\n変更前のニックネームというのかい。贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\nいいかい？切れ者確率${percent}%だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${reply}**`
+      `**お前は${counts.nickname_changes}回目の入浴だねぇ。\nフン。ようやく準備ができたのかい。\n変更前のニックネームというのかい。贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\nいいかい？切れ者確率${percent}%だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
     );
 
+    const userCounts = await loadCount(member.id);
     await sendOrUpdateButtons(message.channel, member.id, userCounts);
     return;
   }
 
-  // バルスコマンド（全員リセット）
-  if (message.channel.id === COUNT_CHANNEL_ID && message.mentions.has(client.user) && message.content.includes('バルス')) {
-    await resetAllCounts();
-    for (const [userId, _] of userButtonMessages.entries()) {
-      await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
-    }
-    await message.channel.send('**全員の集計をリセットしました！**');
-    return;
-  }
-
-  // ニックネーム復帰（画像投稿）
+  // ニックネーム復帰
   if (message.channel.id === NICKNAME_CHANNEL_ID && message.attachments.size > 0) {
     const oldNick = member.nickname?.match(/切れ者確率\d+%/) ? member.user.username : member.nickname;
     if (oldNick) {
@@ -164,45 +174,36 @@ client.on('messageCreate', async message => {
     }
   }
 
-  // 自動削除機能（24時間後）
-  if (message.channel.id === AUTO_DELETE_CHANNEL_ID) {
-    setTimeout(async () => {
-      if (!message.deleted) {
-        await message.delete().catch(console.error);
-      }
-    }, 24 * 60 * 60 * 1000);
+  // バルスコマンド（全員リセット）
+  if (message.channel.id === COUNT_CHANNEL_ID && message.mentions.has(client.user) && message.content.includes('バルス')) {
+    await resetAllCounts();
+    for (const [userId,_] of userButtonMessages.entries()) {
+      await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
+    }
+    await message.channel.send('**全員の集計をリセットしました！**');
   }
 });
 
 // ==== ボタン押下 ====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isButton()) return;
-  const userId = interaction.user.id;
+  const key = interaction.customId;
+  if (!WORD_BUTTONS.includes(key)) return;
 
+  const userId = interaction.user.id;
   if (interaction.message.id !== userButtonMessages.get(userId)?.id) {
     await interaction.reply({ content: 'これはあなたのボタンではありません。', ephemeral: true });
     return;
   }
 
-  if (interaction.customId === 'reset_self') {
-    const resetCounts = { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 };
-    await saveCount(userId, resetCounts);
-    await sendOrUpdateButtons(interaction.channel, userId, resetCounts);
-    await interaction.reply({ content: '**あなたのカウントをリセットしました！**', ephemeral: true });
-    return;
-  }
+  const counts = await loadCount(userId);
+  counts[key] += 1;
+  await saveCount(userId, counts);
 
-  const key = interaction.customId;
-  if (!WORD_BUTTONS.includes(key)) return;
-
-  let userCounts = await loadCount(userId);
-  userCounts[key] += 1;
-  await saveCount(userId, userCounts);
-
-  await sendOrUpdateButtons(interaction.channel, userId, userCounts);
+  await sendOrUpdateButtons(interaction.channel, userId, counts);
 
   const reply = randomReplies[Math.floor(Math.random() * randomReplies.length)];
-  await interaction.reply({ content: `**${BUTTON_LABELS[key]} ${userCounts[key]}回目！ ${reply}**`, ephemeral: true });
+  await interaction.reply({ content: `**${BUTTON_LABELS[key]} ${counts[key]}回目！ ${reply}**`, ephemeral: true });
 });
 
 // ==== Botログイン ====
