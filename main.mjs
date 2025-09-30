@@ -1,9 +1,16 @@
 import 'dotenv/config';
+import express from 'express';
 import { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-// ==== Bot初期化 ====
+// ==== Express Web Server (Render 用) ====
+const app = express();
+const PORT = process.env.PORT || 3000;
+app.get('/', (req, res) => res.send('Bot is running!'));
+app.listen(PORT, () => console.log(`Web server running on port ${PORT}`));
+
+// ==== Discord Bot 初期化 ====
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -19,13 +26,34 @@ const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
 const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
-// ==== Neon/PostgreSQL ====
+// ==== DB 接続 ====
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// ==== 集計ボタン ====
+// ==== 初回起動時に必要テーブルを作成 ====
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS counts (
+      user_id BIGINT PRIMARY KEY,
+      kiremono INTEGER DEFAULT 0,
+      ritaiya INTEGER DEFAULT 0,
+      kirenashi INTEGER DEFAULT 0,
+      nickname_changes INTEGER DEFAULT 0
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS auto_delete_messages (
+      message_id BIGINT PRIMARY KEY,
+      channel_id BIGINT NOT NULL,
+      delete_at BIGINT NOT NULL
+    )
+  `);
+}
+
+// ==== 集計ボタン・ランダム返信 ====
 const WORD_BUTTONS = ['kiremono', 'ritaiya', 'kirenashi'];
 const BUTTON_LABELS = { kiremono: 'きれもの', ritaiya: 'りたいあ', kirenashi: 'きれなし' };
 const randomReplies = [
@@ -43,7 +71,7 @@ const randomReplies = [
   'フン！',
 ];
 
-// ==== DB操作 ====
+// ==== DB 操作 ====
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
   if (!rows.length) return { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 };
@@ -89,8 +117,9 @@ async function sendOrUpdateButtons(channel, userId, userCounts) {
   }
 }
 
-// ==== Bot起動 ====
-client.once('ready', () => {
+// ==== Bot 起動 ====
+client.once('ready', async () => {
+  await initDB();
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
@@ -107,7 +136,7 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const member = message.member;
 
-  // ニックネーム変更チャンネル
+  // ニックネ変更チャンネル
   if (message.channel.id === NICKNAME_CHANNEL_ID) {
     if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
       const counts = await loadCount(member.id);
@@ -115,11 +144,10 @@ client.on('messageCreate', async message => {
       const percent = Math.floor(Math.random() * 121);
       const newNick = `切れ者確率${percent}%`;
       await member.setNickname(newNick).catch(console.error);
-
       await saveCount(member.id, counts);
 
       await message.channel.send(
-        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\n変更前の名は贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
+        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
       );
 
       const userCounts = await loadCount(member.id);
@@ -156,7 +184,7 @@ client.on('messageCreate', async message => {
   // 自動削除メッセージ登録（AUTO_DELETE_CHANNEL_ID）
   if (message.channel.id === AUTO_DELETE_CHANNEL_ID) {
     try {
-      const deleteAt = Date.now() + 24 * 60 * 60 * 1000;
+      const deleteAt = Date.now() + 24 * 60 * 60 * 1000; // 24時間後
       await pool.query(
         'INSERT INTO auto_delete_messages(message_id, channel_id, delete_at) VALUES($1, $2, $3)',
         [message.id, message.channel.id, deleteAt]
@@ -201,7 +229,6 @@ setInterval(async () => {
       try {
         const channel = await client.channels.fetch(row.channel_id);
         if (!channel) continue;
-
         const msg = await channel.messages.fetch(row.message_id).catch(() => null);
         if (msg) await msg.delete().catch(() => {});
       } finally {
@@ -209,9 +236,9 @@ setInterval(async () => {
       }
     }
   } catch (err) {
-    console.error('自動削除チェックエラー:', err);
+    console.error('定期削除エラー:', err);
   }
-}, 60 * 1000);
+}, 60 * 1000); // 1分ごと
 
-// ==== Botログイン ====
+// ==== Bot ログイン ====
 client.login(process.env.DISCORD_TOKEN);
