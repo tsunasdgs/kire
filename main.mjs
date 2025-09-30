@@ -107,11 +107,9 @@ client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const member = message.member;
 
-  // ニックネーム変更チャンネルのみ
+  // ニックネーム変更チャンネル
   if (message.channel.id === NICKNAME_CHANNEL_ID) {
-    // ニックネーム変更トリガー
     if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
-      const oldNick = member.nickname || member.user.username;
       const counts = await loadCount(member.id);
       counts.nickname_changes += 1;
       const percent = Math.floor(Math.random() * 121);
@@ -121,7 +119,7 @@ client.on('messageCreate', async message => {
       await saveCount(member.id, counts);
 
       await message.channel.send(
-        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\nフン。ようやく準備ができたのかい。\n変更前のニックネームというのかい。贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\nいいかい？切れ者確率${percent}%だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
+        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\n変更前の名は贅沢な名だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
       );
 
       const userCounts = await loadCount(member.id);
@@ -129,16 +127,12 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // ニックネーム復帰（画像投稿）
     if (message.attachments.size > 0) {
       const oldNick = member.nickname?.match(/切れ者確率\d+%/) ? member.user.username : member.nickname;
       if (oldNick) {
         await member.setNickname(oldNick).catch(console.error);
-        await message.channel.send(
-          '**それがお前の答えかい？\nいきな！\nお前の勝ちだ！\n早くいっちまいな！！\nフン！**'
-        );
+        await message.channel.send('**それがお前の答えかい？\nお前の勝ちだ！**');
 
-        // ボタン非表示
         if (userButtonMessages.has(member.id)) {
           await userButtonMessages.get(member.id).delete().catch(console.error);
           userButtonMessages.delete(member.id);
@@ -147,7 +141,7 @@ client.on('messageCreate', async message => {
     }
   }
 
-  // バルスコマンド（COUNT_CHANNEL_ID）
+  // 集計リセット（COUNT_CHANNEL_ID）
   if (message.channel.id === COUNT_CHANNEL_ID) {
     if (message.mentions.has(client.user) && message.content.includes('バルス')) {
       await resetAllCounts();
@@ -159,11 +153,17 @@ client.on('messageCreate', async message => {
     }
   }
 
-  // 自動削除（AUTO_DELETE_CHANNEL_ID）
+  // 自動削除メッセージ登録（AUTO_DELETE_CHANNEL_ID）
   if (message.channel.id === AUTO_DELETE_CHANNEL_ID) {
-    setTimeout(async () => {
-      if (!message.deleted) await message.delete().catch(console.error);
-    }, 24 * 60 * 60 * 1000);
+    try {
+      const deleteAt = Date.now() + 24 * 60 * 60 * 1000;
+      await pool.query(
+        'INSERT INTO auto_delete_messages(message_id, channel_id, delete_at) VALUES($1, $2, $3)',
+        [message.id, message.channel.id, deleteAt]
+      );
+    } catch (err) {
+      console.error('自動削除メッセージ登録エラー:', err);
+    }
   }
 });
 
@@ -188,6 +188,30 @@ client.on('interactionCreate', async interaction => {
   const reply = randomReplies[Math.floor(Math.random() * randomReplies.length)];
   await interaction.reply({ content: `**${BUTTON_LABELS[key]} ${userCounts[key]}回目！ ${reply}**`, ephemeral: true });
 });
+
+// ==== 定期削除タスク（1分ごと） ====
+setInterval(async () => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM auto_delete_messages WHERE delete_at <= $1',
+      [Date.now()]
+    );
+
+    for (const row of rows) {
+      try {
+        const channel = await client.channels.fetch(row.channel_id);
+        if (!channel) continue;
+
+        const msg = await channel.messages.fetch(row.message_id).catch(() => null);
+        if (msg) await msg.delete().catch(() => {});
+      } finally {
+        await pool.query('DELETE FROM auto_delete_messages WHERE message_id=$1', [row.message_id]);
+      }
+    }
+  } catch (err) {
+    console.error('自動削除チェックエラー:', err);
+  }
+}, 60 * 1000);
 
 // ==== Botログイン ====
 client.login(process.env.DISCORD_TOKEN);
