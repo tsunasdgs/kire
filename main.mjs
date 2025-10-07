@@ -39,15 +39,21 @@ const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
 const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
-// ★ 追加：ファン数UI用チャンネル（単一）
+// ★ ファン数UI用チャンネル（単一）
 const FANS_CHANNEL_ID = process.env.FANS_CHANNEL_ID || '1425079163005571132';
-// 追加：入力レート制限（秒）
+// 入力レート制限（秒）
 const FANS_MIN_INTERVAL_SEC = parseInt(process.env.FANS_MIN_INTERVAL_SEC || '30', 10);
-// 追加：減少値を許可するか
+// 減少値を許可するか（通常入力）
 const FANS_ALLOW_DECREASE = (process.env.FANS_ALLOW_DECREASE || 'false').toLowerCase() === 'true';
+// ★ 訂正時は減少も許可するか（既定 true）
+const FANS_EDIT_ALLOW_DECREASE = (process.env.FANS_EDIT_ALLOW_DECREASE || 'true').toLowerCase() === 'true';
+// ★ 訂正はレート制限をバイパスするか（既定 true）
+const FANS_EDIT_BYPASS_RATE = (process.env.FANS_EDIT_BYPASS_RATE || 'true').toLowerCase() === 'true';
 
-// 追加：匿名投票を許可するチャンネル（未指定ならどこでもOK、カンマ区切り）
+// 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+// ★ 匿名投票：最大選択肢数（既定 10）
+const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS || '10', 10) || 10, 25); // Discordは1メッセ最大25ボタン（5x5行）に配慮
 
 /* ==============================
    DB 接続
@@ -58,7 +64,7 @@ const pool = new Pool({
 });
 
 /* ==============================
-   初回起動時に必要テーブルを作成
+   初回起動時に必要テーブルを作成/更新
 ============================== */
 async function initDB() {
   // 既存
@@ -79,7 +85,7 @@ async function initDB() {
     )
   `);
 
-  // ★ 追加：ファン数
+  // ファン数
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_snapshots (
       guild_id TEXT NOT NULL,
@@ -89,11 +95,11 @@ async function initDB() {
       source   TEXT NOT NULL DEFAULT 'manual',
       note     TEXT,
       PRIMARY KEY (guild_id, user_id, snapshot_ts)
-    );
+    )
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS idx_fan_snapshots_lookup
-      ON fan_snapshots (guild_id, user_id, snapshot_ts DESC);
+      ON fan_snapshots (guild_id, user_id, snapshot_ts DESC)
   `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_monthly (
@@ -106,10 +112,10 @@ async function initDB() {
       updates   INT NOT NULL DEFAULT 1,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (guild_id, user_id, month_key)
-    );
+    )
   `);
 
-  // ★ 追加：匿名投票
+  // 匿名投票（構造拡張：multi_allowedとvotes主キー変更）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS anon_polls (
       poll_id      TEXT PRIMARY KEY,   -- message_id を使う
@@ -120,17 +126,49 @@ async function initDB() {
       is_closed    BOOLEAN NOT NULL DEFAULT FALSE,
       created_by   TEXT NOT NULL,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
   `);
+  // multi_allowed 追加（なければ）
+  await pool.query(`ALTER TABLE anon_polls ADD COLUMN IF NOT EXISTS multi_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS anon_votes (
       poll_id   TEXT NOT NULL,
       user_id   TEXT NOT NULL,
-      choice    INT NOT NULL,          -- 0-based index
-      voted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-      PRIMARY KEY (poll_id, user_id),
-      FOREIGN KEY (poll_id) REFERENCES anon_polls(poll_id) ON DELETE CASCADE
-    );
+      choice    INT  NOT NULL,
+      voted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+  // 旧PKを新形式へ（(poll_id,user_id) → (poll_id,user_id,choice)）
+  await pool.query(`DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.table_constraints
+      WHERE table_name='anon_votes' AND constraint_type='PRIMARY KEY' AND constraint_name='anon_votes_pkey'
+    ) THEN
+      -- 既存PKを一旦外して付け直し（IF NOT EXISTSが無いので安全に）
+      BEGIN
+        ALTER TABLE anon_votes DROP CONSTRAINT anon_votes_pkey;
+      EXCEPTION WHEN undefined_object THEN
+        -- 既に外れている場合は無視
+      END;
+    END IF;
+  END $$;`);
+  await pool.query(`ALTER TABLE anon_votes ADD CONSTRAINT anon_votes_pkey PRIMARY KEY (poll_id, user_id, choice)`);
+
+  // 外部キー
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_name='anon_votes' AND constraint_name='anon_votes_poll_id_fkey'
+      ) THEN
+        ALTER TABLE anon_votes
+          ADD CONSTRAINT anon_votes_poll_id_fkey
+          FOREIGN KEY (poll_id) REFERENCES anon_polls(poll_id) ON DELETE CASCADE;
+      END IF;
+    END $$;
   `);
 }
 
@@ -154,7 +192,7 @@ const randomReplies = [
   'フン！',
 ];
 
-// JSTのYYYY-MMキーを返す
+// JSTのYYYY-MMキー
 function getJstMonthKey(date = new Date()) {
   const d = new Date(date.getTime() + 9 * 60 * 60 * 1000); // JST補正
   const y = d.getUTCFullYear();
@@ -212,7 +250,7 @@ async function sendOrUpdateButtons(channel, userId, userCounts) {
 }
 
 /* ==============================
-   ★ ファン数：UIコンポーネント
+   ファン数：UIコンポーネント
 ============================== */
 function fansPanel() {
   return {
@@ -225,7 +263,9 @@ function fansPanel() {
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('fans:set').setLabel('現在の累計ファン数を入力').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('fans:my').setLabel('自分の記録を見る').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId('fans:my').setLabel('自分の記録を見る').setStyle(ButtonStyle.Primary),
+        // ★ 訂正ボタン
+        new ButtonBuilder().setCustomId('fans:edit').setLabel('前回入力を訂正').setStyle(ButtonStyle.Secondary)
       )
     ]
   };
@@ -246,27 +286,41 @@ function fansModal(currentValue = '') {
       )
     );
 }
+function fansEditModal(prevValue = '') {
+  return new ModalBuilder()
+    .setCustomId('fans:modal_edit')
+    .setTitle('訂正：累計ファン数を入力（上書き）')
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('fans:value_edit')
+          .setLabel('訂正後の累計ファン数（整数）')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('例: 1234567')
+          .setRequired(true)
+          .setValue(prevValue)
+      )
+    );
+}
 
 /* ==============================
-   ★ ファン数：ロジック
+   ファン数：ロジック
 ============================== */
-async function insertSnapshotAndUpsertMonthly(guildId, userId, value) {
+async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = 'manual') {
   // スナップショット保存
   await pool.query(
-    `INSERT INTO fan_snapshots (guild_id, user_id, fans_total) VALUES ($1,$2,$3)`,
-    [guildId, userId, value]
+    `INSERT INTO fan_snapshots (guild_id, user_id, fans_total, source) VALUES ($1,$2,$3,$4)`,
+    [guildId, userId, value, source]
   );
 
   // 月次アップサート（JST基準）
   const monthKey = getJstMonthKey();
-  // 既存row取得
   const { rows } = await pool.query(
     `SELECT base_fans, last_fans, updates FROM fan_monthly WHERE guild_id=$1 AND user_id=$2 AND month_key=$3`,
     [guildId, userId, monthKey]
   );
 
   if (!rows.length) {
-    // 初回＝ベース＆ラスト同値、delta=0
     await pool.query(
       `INSERT INTO fan_monthly (guild_id,user_id,month_key,base_fans,last_fans,delta_fans,updates)
        VALUES ($1,$2,$3,$4,$4,0,1)`,
@@ -306,28 +360,48 @@ async function fetchMyMonth(guildId, userId, monthKey = getJstMonthKey()) {
   };
 }
 
+async function fetchLastSnapshotValue(guildId, userId) {
+  const { rows } = await pool.query(
+    `SELECT fans_total FROM fan_snapshots WHERE guild_id=$1 AND user_id=$2 ORDER BY snapshot_ts DESC LIMIT 1`,
+    [guildId, userId]
+  );
+  return rows.length ? Number(rows[0].fans_total) : null;
+}
+
 /* ==============================
-   ★ 匿名投票：UI/ロジック
+   匿名投票：UI/ロジック
 ============================== */
-function buildPollEmbed(question, options, isClosed = false) {
+function buildPollEmbed(question, options, isClosed = false, multi = false) {
   const desc = options.map((opt, i) => `**${i + 1}.** ${opt}`).join('\n');
   return new EmbedBuilder()
     .setTitle(isClosed ? '📊 匿名投票（結果）' : '🗳️ 匿名投票')
     .setDescription(`**Q:** ${question}\n\n${desc}`)
-    .setFooter({ text: isClosed ? 'この投票は締め切られました' : '投票は匿名で記録されます' });
+    .setFooter({ text: isClosed ? 'この投票は締め切られました' : (multi ? '複数選択が可能です' : '1つだけ選べます') });
+}
+function chunk(array, size) {
+  const out = [];
+  for (let i = 0; i < array.length; i += size) out.push(array.slice(i, i + size));
+  return out;
 }
 function buildPollButtons(options, disabled = false) {
-  const row = new ActionRowBuilder();
-  options.forEach((_, i) => {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`anonpoll:vote:${i}`)
-        .setLabel(String(i + 1))
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(disabled)
-    );
-  });
-  return [row];
+  // 1行最大5ボタン、最大25ボタンまで
+  const rows = [];
+  const chunks = chunk(options, 5);
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const row = new ActionRowBuilder();
+    chunks[ci].forEach((_, i) => {
+      const index = ci * 5 + i;
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`anonpoll:vote:${index}`)
+          .setLabel(String(index + 1))
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(disabled)
+      );
+    });
+    rows.push(row);
+  }
+  return rows;
 }
 
 async function countPoll(pollId) {
@@ -344,7 +418,7 @@ async function countPoll(pollId) {
    スラッシュコマンド登録
 ============================== */
 async function registerCommands(applicationId, guilds) {
-  // /fans ui, /fans set, /fans my [month]
+  // /fans ui, /fans set, /fans my, /fans edit
   const fans = new SlashCommandBuilder()
     .setName('fans')
     .setDescription('ウマ娘ファン数トラッキング')
@@ -352,7 +426,10 @@ async function registerCommands(applicationId, guilds) {
     .addSubcommand(sc => sc.setName('set').setDescription('現在の累計ファン数を登録')
       .addIntegerOption(opt => opt.setName('value').setDescription('累計ファン数').setRequired(true)))
     .addSubcommand(sc => sc.setName('my').setDescription('自分の月次記録を表示')
-      .addStringOption(opt => opt.setName('month').setDescription('YYYY-MM（省略時は今月）')));
+      .addStringOption(opt => opt.setName('month').setDescription('YYYY-MM（省略時は今月）')))
+    // ★ 訂正用（小さい値も許容）
+    .addSubcommand(sc => sc.setName('edit').setDescription('前回入力の訂正（小さい値も許容）')
+      .addIntegerOption(opt => opt.setName('value').setDescription('訂正後の累計ファン数').setRequired(true)));
 
   // /anonpoll create, /anonpoll close
   const anonpoll = new SlashCommandBuilder()
@@ -360,7 +437,9 @@ async function registerCommands(applicationId, guilds) {
     .setDescription('匿名投票を作成/管理')
     .addSubcommand(sc => sc.setName('create').setDescription('匿名投票を作成')
       .addStringOption(o => o.setName('question').setDescription('質問文').setRequired(true))
-      .addStringOption(o => o.setName('options').setDescription('選択肢をカンマ区切りで最大5個').setRequired(true)))
+      // 日本語入力しやすい区切りをサポート：改行/読点/全角コンマ/半角カンマ
+      .addStringOption(o => o.setName('options').setDescription('選択肢（改行・読点・コンマ区切り、最大10）').setRequired(true))
+      .addBooleanOption(o => o.setName('multi').setDescription('複数投票を許可する（既定: OFF）')))
     .addSubcommand(sc => sc.setName('close').setDescription('匿名投票を締め切る')
       .addStringOption(o => o.setName('message_id').setDescription('投票メッセージID').setRequired(true)));
 
@@ -384,7 +463,7 @@ client.once('ready', async () => {
   const guilds = client.guilds.cache.map(g => g);
   await registerCommands(client.application.id, guilds);
 
-  // ファン数パネルを専用chに（存在すれば）設置 or 更新
+  // ファン数パネルを専用chに（存在すれば）設置
   for (const g of guilds) {
     try {
       const ch = await client.channels.fetch(FANS_CHANNEL_ID).catch(() => null);
@@ -497,34 +576,37 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: 'パネルを設置しました。', ephemeral: true });
         }
 
-        if (sub === 'set') {
+        if (sub === 'set' || sub === 'edit') {
           const value = interaction.options.getInteger('value', true);
           const now = Date.now();
-          const last = fansLastInputAt.get(interaction.user.id) || 0;
-          if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
-            const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
-          }
 
-          // 直近の値（減少チェック）
-          const { rows } = await pool.query(
-            `SELECT fans_total FROM fan_snapshots WHERE guild_id=$1 AND user_id=$2 ORDER BY snapshot_ts DESC LIMIT 1`,
-            [interaction.guildId, interaction.user.id]
-          );
-          if (rows.length && !FANS_ALLOW_DECREASE) {
-            const prev = Number(rows[0].fans_total);
-            if (value < prev) {
-              return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
+          // レート制限（editは設定に応じてバイパス）
+          if (!(sub === 'edit' && FANS_EDIT_BYPASS_RATE)) {
+            const last = fansLastInputAt.get(interaction.user.id) || 0;
+            if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
+              const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
+              return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
             }
           }
 
-          const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value);
+          // 直近値と減少許可フラグ
+          const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+          const allowDecrease = sub === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
+          if (prev !== null && !allowDecrease && value < prev) {
+            return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
+          }
+
+          const result = await insertSnapshotAndUpsertMonthly(
+            interaction.guildId,
+            interaction.user.id,
+            value,
+            sub === 'edit' ? 'corrected' : 'manual'
+          );
           fansLastInputAt.set(interaction.user.id, now);
 
           const embed = new EmbedBuilder()
-            .setTitle('📈 登録完了')
-            .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`)
-            .setFooter({ text: '入力は匿名ではありません（あなたの記録として保存されます）' });
+            .setTitle(sub === 'edit' ? '✏️ 訂正を反映しました' : '📈 登録完了')
+            .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
           return interaction.reply({ embeds: [embed], ephemeral: true });
         }
 
@@ -553,27 +635,38 @@ client.on('interactionCreate', async interaction => {
 
         if (sub === 'create') {
           const q = interaction.options.getString('question', true).trim();
-          const optCsv = interaction.options.getString('options', true);
-          const options = optCsv.split(',').map(s => s.trim()).filter(Boolean).slice(0, 5);
+
+          // 日本語入力しやすい分割：改行 / 読点 / 全角コンマ / 半角カンマ
+          const raw = interaction.options.getString('options', true);
+          const options = raw
+            .split(/[\n、，,]+/g)
+            .map(s => s.trim())
+            .filter(Boolean)
+            .slice(0, ANONPOLL_MAX_OPTIONS);
+
           if (options.length < 2) {
-            return interaction.reply({ content: '選択肢は2個以上、最大5個で指定してください。', ephemeral: true });
+            return interaction.reply({ content: `選択肢は2個以上、最大${ANONPOLL_MAX_OPTIONS}個で指定してください。`, ephemeral: true });
           }
-          const embed = buildPollEmbed(q, options, false);
+
+          const multi = interaction.options.getBoolean('multi') || false;
+
+          const embed = buildPollEmbed(q, options, false, multi);
           const components = buildPollButtons(options);
           const msg = await interaction.channel.send({ embeds: [embed], components });
 
           // 保存（poll_id=message.id）
           await pool.query(
-            `INSERT INTO anon_polls(poll_id,guild_id,channel_id,question,options,created_by) VALUES ($1,$2,$3,$4,$5,$6)`,
-            [msg.id, interaction.guildId, interaction.channelId, q, options, interaction.user.id]
+            `INSERT INTO anon_polls(poll_id,guild_id,channel_id,question,options,created_by,multi_allowed)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [msg.id, interaction.guildId, interaction.channelId, q, options, interaction.user.id, multi]
           );
           return interaction.reply({ content: '匿名投票を作成しました。', ephemeral: true });
         }
 
         if (sub === 'close') {
           const mid = interaction.options.getString('message_id', true);
-          // 権限：作成者 or 管理権限
-          const { rows } = await pool.query(`SELECT created_by, options, is_closed FROM anon_polls WHERE poll_id=$1`, [mid]);
+          // 取得
+          const { rows } = await pool.query(`SELECT created_by, options, is_closed, question, channel_id FROM anon_polls WHERE poll_id=$1`, [mid]);
           if (!rows.length) return interaction.reply({ content: '指定の投票が見つかりません。', ephemeral: true });
           const poll = rows[0];
           const isManager = interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages);
@@ -593,11 +686,11 @@ client.on('interactionCreate', async interaction => {
           }).join('\n');
 
           // メッセージ編集（ボタン無効化 & 結果表示）
-          const channel = await client.channels.fetch(ANONPOLL_CHANNEL_IDS.length ? ANONPOLL_CHANNEL_IDS[0] : interaction.channelId).catch(() => null);
+          const channel = await client.channels.fetch(poll.channel_id).catch(() => null);
           let msg = null;
           if (channel) msg = await channel.messages.fetch(mid).catch(() => null);
           if (msg) {
-            const resultEmbed = buildPollEmbed(poll.question, options, true).setDescription(`**Q:** ${poll.question}\n\n${lines}`);
+            const resultEmbed = buildPollEmbed(poll.question, options, true, false).setDescription(`**Q:** ${poll.question}\n\n${lines}`);
             await msg.edit({ embeds: [resultEmbed], components: buildPollButtons(options, true) });
           }
           await pool.query(`UPDATE anon_polls SET is_closed=TRUE WHERE poll_id=$1`, [mid]);
@@ -624,7 +717,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**`, ephemeral: true });
       }
 
-      // ★ fans
+      // ファン数：入力
       if (id === 'fans:set') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -632,6 +725,7 @@ client.on('interactionCreate', async interaction => {
         const modal = fansModal();
         return interaction.showModal(modal);
       }
+      // ファン数：自分の記録
       if (id === 'fans:my') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -646,23 +740,53 @@ client.on('interactionCreate', async interaction => {
           .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
+      // ★ ファン数：訂正モーダル
+      if (id === 'fans:edit') {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+        const modal = fansEditModal(prev !== null ? String(prev) : '');
+        return interaction.showModal(modal);
+      }
 
-      // ★ 匿名投票 票ボタン `anonpoll:vote:N`
+      // ★ 匿名投票 票ボタン
       if (id.startsWith('anonpoll:vote:')) {
         const idx = Number(id.split(':')[2] || '0');
-        // 該当メッセージ＝poll
         const pollId = interaction.message.id;
-        // 既にクローズか確認
-        const { rows } = await pool.query(`SELECT is_closed FROM anon_polls WHERE poll_id=$1`, [pollId]);
+        // 投票状態取得
+        const { rows } = await pool.query(`SELECT is_closed, multi_allowed FROM anon_polls WHERE poll_id=$1`, [pollId]);
         if (!rows.length) return interaction.reply({ content: '投票データが見つかりません。', ephemeral: true });
         if (rows[0].is_closed) return interaction.reply({ content: 'この投票は締め切られています。', ephemeral: true });
 
-        // 1ユーザー1票（上書き可）
-        await pool.query(`
-          INSERT INTO anon_votes(poll_id,user_id,choice)
-          VALUES ($1,$2,$3)
-          ON CONFLICT (poll_id,user_id) DO UPDATE SET choice=EXCLUDED.choice, voted_at=now()
-        `, [pollId, interaction.user.id, idx]);
+        const multi = rows[0].multi_allowed;
+
+        if (multi) {
+          // 複数選択：トグル（既に同じchoiceがあれば削除、無ければ追加）
+          const exists = await pool.query(
+            `SELECT 1 FROM anon_votes WHERE poll_id=$1 AND user_id=$2 AND choice=$3`,
+            [pollId, interaction.user.id, idx]
+          );
+          if (exists.rowCount) {
+            await pool.query(
+              `DELETE FROM anon_votes WHERE poll_id=$1 AND user_id=$2 AND choice=$3`,
+              [pollId, interaction.user.id, idx]
+            );
+          } else {
+            await pool.query(
+              `INSERT INTO anon_votes(poll_id,user_id,choice) VALUES ($1,$2,$3)
+               ON CONFLICT (poll_id,user_id,choice) DO UPDATE SET voted_at=now()`,
+              [pollId, interaction.user.id, idx]
+            );
+          }
+        } else {
+          // 単独選択：以前の票を全削除 → 今回の票をセット
+          await pool.query(`DELETE FROM anon_votes WHERE poll_id=$1 AND user_id=$2`, [pollId, interaction.user.id]);
+          await pool.query(
+            `INSERT INTO anon_votes(poll_id,user_id,choice) VALUES ($1,$2,$3)`,
+            [pollId, interaction.user.id, idx]
+          );
+        }
 
         // 現在票数（匿名のまま本人に通知）
         const counts = await countPoll(pollId);
@@ -673,6 +797,7 @@ client.on('interactionCreate', async interaction => {
 
     /* ---------- モーダル ---------- */
     if (interaction.type === InteractionType.ModalSubmit) {
+      // 入力
       if (interaction.customId === 'fans:modal') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -690,23 +815,52 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
         }
 
-        // 減少チェック
-        const { rows } = await pool.query(
-          `SELECT fans_total FROM fan_snapshots WHERE guild_id=$1 AND user_id=$2 ORDER BY snapshot_ts DESC LIMIT 1`,
-          [interaction.guildId, interaction.user.id]
-        );
-        if (rows.length && !FANS_ALLOW_DECREASE) {
-          const prev = Number(rows[0].fans_total);
-          if (value < prev) {
-            return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
-          }
+        // 減少チェック（通常入力）
+        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+        if (prev !== null && !FANS_ALLOW_DECREASE && value < prev) {
+          return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
         }
 
-        const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value);
+        const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'manual');
         fansLastInputAt.set(interaction.user.id, now);
 
         const embed = new EmbedBuilder()
           .setTitle('📈 登録完了')
+          .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+      }
+
+      // ★ 訂正
+      if (interaction.customId === 'fans:modal_edit') {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+        const raw = interaction.fields.getTextInputValue('fans:value_edit').replace(/[,，\s]/g, '');
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < 0) {
+          return interaction.reply({ content: '整数の累計ファン数を入力してください。', ephemeral: true });
+        }
+
+        const now = Date.now();
+        if (!FANS_EDIT_BYPASS_RATE) {
+          const last = fansLastInputAt.get(interaction.user.id) || 0;
+          if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
+            const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
+            return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+          }
+        }
+
+        // 訂正は減少も許可（設定）
+        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+        if (prev !== null && !FANS_EDIT_ALLOW_DECREASE && value < prev) {
+          return interaction.reply({ content: `設定により小さい値での訂正は許可されていません。`, ephemeral: true });
+        }
+
+        const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'corrected');
+        fansLastInputAt.set(interaction.user.id, now);
+
+        const embed = new EmbedBuilder()
+          .setTitle('✏️ 訂正を反映しました')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
