@@ -1,4 +1,10 @@
-// main.mjs
+// ==============================
+// main.mjs  — 完全版（Node 22 / discord.js v14 / Neon / Render / JST）
+// 互換維持：counts / auto_delete / fan_snapshots + fan_monthly / anon_polls(multi) / anon_votes(PK拡張)
+//           / スラコマ /fans /anonpoll / Express keep-alive / 定期削除
+// 変更点：ファン数トラッキングに「ベース値訂正」ボタン＆/fans edit を追加
+// ==============================
+
 import 'dotenv/config';
 import express from 'express';
 import {
@@ -52,8 +58,8 @@ const FANS_EDIT_BYPASS_RATE = (process.env.FANS_EDIT_BYPASS_RATE || 'true').toLo
 
 // 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-// ★ 匿名投票：最大選択肢数（既定 10）
-const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS || '10', 10) || 10, 25); // Discordは1メッセ最大25ボタン（5x5行）に配慮
+// ★ 匿名投票：最大選択肢数（既定 10、Discord 25ボタン制約に配慮）
+const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS || '10', 10) || 10, 25);
 
 /* ==============================
    DB 接続
@@ -67,7 +73,7 @@ const pool = new Pool({
    初回起動時に必要テーブルを作成/更新
 ============================== */
 async function initDB() {
-  // 既存
+  // 既存：counts
   await pool.query(`
     CREATE TABLE IF NOT EXISTS counts (
       user_id BIGINT PRIMARY KEY,
@@ -77,6 +83,8 @@ async function initDB() {
       nickname_changes INTEGER DEFAULT 0
     )
   `);
+
+  // 既存：自動削除メッセージ
   await pool.query(`
     CREATE TABLE IF NOT EXISTS auto_delete_messages (
       message_id BIGINT PRIMARY KEY,
@@ -85,7 +93,7 @@ async function initDB() {
     )
   `);
 
-  // ファン数
+  // 既存：ファン数スナップショット
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_snapshots (
       guild_id TEXT NOT NULL,
@@ -101,6 +109,8 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_fan_snapshots_lookup
       ON fan_snapshots (guild_id, user_id, snapshot_ts DESC)
   `);
+
+  // 既存：月次集計（JST 月キー）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_monthly (
       guild_id  TEXT NOT NULL,
@@ -115,7 +125,7 @@ async function initDB() {
     )
   `);
 
-  // 匿名投票（構造拡張：multi_allowedとvotes主キー変更）
+  // 既存：匿名投票（multi_allowed あり）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS anon_polls (
       poll_id      TEXT PRIMARY KEY,   -- message_id を使う
@@ -128,7 +138,6 @@ async function initDB() {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
-  // multi_allowed 追加（なければ）
   await pool.query(`ALTER TABLE anon_polls ADD COLUMN IF NOT EXISTS multi_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
@@ -139,24 +148,23 @@ async function initDB() {
       voted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
-  // 旧PKを新形式へ（(poll_id,user_id) → (poll_id,user_id,choice)）
+
+  // 既存 PK を (poll_id,user_id,choice) へ拡張（冪等）
   await pool.query(`DO $$
   BEGIN
     IF EXISTS (
       SELECT 1 FROM information_schema.table_constraints
       WHERE table_name='anon_votes' AND constraint_type='PRIMARY KEY' AND constraint_name='anon_votes_pkey'
     ) THEN
-      -- 既存PKを一旦外して付け直し（IF NOT EXISTSが無いので安全に）
       BEGIN
         ALTER TABLE anon_votes DROP CONSTRAINT anon_votes_pkey;
       EXCEPTION WHEN undefined_object THEN
-        -- 既に外れている場合は無視
       END;
     END IF;
   END $$;`);
   await pool.query(`ALTER TABLE anon_votes ADD CONSTRAINT anon_votes_pkey PRIMARY KEY (poll_id, user_id, choice)`);
 
-  // 外部キー
+  // FK（冪等）
   await pool.query(`
     DO $$
     BEGIN
@@ -173,7 +181,7 @@ async function initDB() {
 }
 
 /* ==============================
-   共通ユーティリティ
+   ユーティリティ
 ============================== */
 const WORD_BUTTONS = ['kiremono', 'ritaiya', 'kirenashi'];
 const BUTTON_LABELS = { kiremono: 'きれもの', ritaiya: 'りたいあ', kirenashi: 'きれなし' };
@@ -192,19 +200,19 @@ const randomReplies = [
   'フン！',
 ];
 
-// JSTのYYYY-MMキー
+// JST の YYYY-MM
 function getJstMonthKey(date = new Date()) {
-  const d = new Date(date.getTime() + 9 * 60 * 60 * 1000); // JST補正
+  const d = new Date(date.getTime() + 9 * 60 * 60 * 1000);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   return `${y}-${m}`;
 }
 
-// レート制限メモ（ユーザーごと）
+// 入力のレート制限（ユーザー単位）
 const fansLastInputAt = new Map();
 
 /* ==============================
-   DB ヘルパー（既存）
+   DB ヘルパー（counts）
 ============================== */
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
@@ -224,7 +232,7 @@ async function resetAllCounts() {
 }
 
 /* ==============================
-   ボタン管理（既存）
+   counts ボタン UI
 ============================== */
 const userButtonMessages = new Map();
 function createButtonRow(userCounts) {
@@ -250,7 +258,7 @@ async function sendOrUpdateButtons(channel, userId, userCounts) {
 }
 
 /* ==============================
-   ファン数：UIコンポーネント
+   ファン数：UI（ベース値訂正ボタン付き）
 ============================== */
 function fansPanel() {
   return {
@@ -264,7 +272,7 @@ function fansPanel() {
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('fans:set').setLabel('現在の累計ファン数を入力').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId('fans:my').setLabel('自分の記録を見る').setStyle(ButtonStyle.Primary),
-        // ★ 訂正ボタン
+        // ★ 変更点：訂正ボタンを追加
         new ButtonBuilder().setCustomId('fans:edit').setLabel('前回入力を訂正').setStyle(ButtonStyle.Secondary)
       )
     ]
@@ -341,7 +349,6 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
     return { monthKey, base, last, delta, updates };
   }
 }
-
 async function fetchMyMonth(guildId, userId, monthKey = getJstMonthKey()) {
   const { rows } = await pool.query(
     `SELECT base_fans,last_fans,delta_fans,updates,updated_at
@@ -359,7 +366,6 @@ async function fetchMyMonth(guildId, userId, monthKey = getJstMonthKey()) {
     updatedAt: r.updated_at
   };
 }
-
 async function fetchLastSnapshotValue(guildId, userId) {
   const { rows } = await pool.query(
     `SELECT fans_total FROM fan_snapshots WHERE guild_id=$1 AND user_id=$2 ORDER BY snapshot_ts DESC LIMIT 1`,
@@ -384,7 +390,6 @@ function chunk(array, size) {
   return out;
 }
 function buildPollButtons(options, disabled = false) {
-  // 1行最大5ボタン、最大25ボタンまで
   const rows = [];
   const chunks = chunk(options, 5);
   for (let ci = 0; ci < chunks.length; ci++) {
@@ -403,7 +408,6 @@ function buildPollButtons(options, disabled = false) {
   }
   return rows;
 }
-
 async function countPoll(pollId) {
   const { rows } = await pool.query(
     `SELECT choice, COUNT(*)::int AS c FROM anon_votes WHERE poll_id=$1 GROUP BY choice ORDER BY choice`,
@@ -427,7 +431,7 @@ async function registerCommands(applicationId, guilds) {
       .addIntegerOption(opt => opt.setName('value').setDescription('累計ファン数').setRequired(true)))
     .addSubcommand(sc => sc.setName('my').setDescription('自分の月次記録を表示')
       .addStringOption(opt => opt.setName('month').setDescription('YYYY-MM（省略時は今月）')))
-    // ★ 訂正用（小さい値も許容）
+    // ★ 訂正（小さい値も許容、設定で可変）
     .addSubcommand(sc => sc.setName('edit').setDescription('前回入力の訂正（小さい値も許容）')
       .addIntegerOption(opt => opt.setName('value').setDescription('訂正後の累計ファン数').setRequired(true)));
 
@@ -437,14 +441,12 @@ async function registerCommands(applicationId, guilds) {
     .setDescription('匿名投票を作成/管理')
     .addSubcommand(sc => sc.setName('create').setDescription('匿名投票を作成')
       .addStringOption(o => o.setName('question').setDescription('質問文').setRequired(true))
-      // 日本語入力しやすい区切りをサポート：改行/読点/全角コンマ/半角カンマ
       .addStringOption(o => o.setName('options').setDescription('選択肢（改行・読点・コンマ区切り、最大10）').setRequired(true))
       .addBooleanOption(o => o.setName('multi').setDescription('複数投票を許可する（既定: OFF）')))
     .addSubcommand(sc => sc.setName('close').setDescription('匿名投票を締め切る')
       .addStringOption(o => o.setName('message_id').setDescription('投票メッセージID').setRequired(true)));
 
   const body = [fans, anonpoll].map(c => c.toJSON());
-
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   for (const g of guilds) {
     await rest.put(Routes.applicationGuildCommands(applicationId, g.id), { body });
@@ -459,7 +461,7 @@ client.once('ready', async () => {
   await initDB();
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  // スラッシュコマンド登録（参加している全ギルドに）
+  // スラッシュコマンド登録（参加している全ギルド）
   const guilds = client.guilds.cache.map(g => g);
   await registerCommands(client.application.id, guilds);
 
@@ -477,7 +479,7 @@ client.once('ready', async () => {
 });
 
 /* ==============================
-   自動ロール付与（既存）
+   自動ロール付与
 ============================== */
 client.on('guildMemberAdd', async member => {
   if (AUTO_ROLE_ID) {
@@ -487,13 +489,13 @@ client.on('guildMemberAdd', async member => {
 });
 
 /* ==============================
-   メッセージ監視（既存）
+   メッセージ監視（counts / auto_delete）
 ============================== */
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const member = message.member;
 
-  // ニックネ変更チャンネル
+  // ニックネ変更チャンネル：切れ者ネタ
   if (message.channel.id === NICKNAME_CHANNEL_ID) {
     if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
       const counts = await loadCount(member.id);
@@ -530,7 +532,7 @@ client.on('messageCreate', async message => {
   if (message.channel.id === COUNT_CHANNEL_ID) {
     if (message.mentions.has(client.user) && message.content.includes('バルス')) {
       await resetAllCounts();
-      for (const [userId, _] of userButtonMessages.entries()) {
+      for (const [userId] of userButtonMessages.entries()) {
         await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
       }
       await message.channel.send('**全員の集計をリセットしました！**');
@@ -580,7 +582,7 @@ client.on('interactionCreate', async interaction => {
           const value = interaction.options.getInteger('value', true);
           const now = Date.now();
 
-          // レート制限（editは設定に応じてバイパス）
+          // レート制限（edit は設定に応じてバイパス）
           if (!(sub === 'edit' && FANS_EDIT_BYPASS_RATE)) {
             const last = fansLastInputAt.get(interaction.user.id) || 0;
             if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
@@ -589,7 +591,7 @@ client.on('interactionCreate', async interaction => {
             }
           }
 
-          // 直近値と減少許可フラグ
+          // 直近値と減少許可
           const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
           const allowDecrease = sub === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
           if (prev !== null && !allowDecrease && value < prev) {
@@ -635,9 +637,8 @@ client.on('interactionCreate', async interaction => {
 
         if (sub === 'create') {
           const q = interaction.options.getString('question', true).trim();
-
-          // 日本語入力しやすい分割：改行 / 読点 / 全角コンマ / 半角カンマ
           const raw = interaction.options.getString('options', true);
+          // 日本語入力しやすい分割：改行 / 読点 / 全角コンマ / 半角カンマ
           const options = raw
             .split(/[\n、，,]+/g)
             .map(s => s.trim())
@@ -665,7 +666,6 @@ client.on('interactionCreate', async interaction => {
 
         if (sub === 'close') {
           const mid = interaction.options.getString('message_id', true);
-          // 取得
           const { rows } = await pool.query(`SELECT created_by, options, is_closed, question, channel_id FROM anon_polls WHERE poll_id=$1`, [mid]);
           if (!rows.length) return interaction.reply({ content: '指定の投票が見つかりません。', ephemeral: true });
           const poll = rows[0];
@@ -703,7 +703,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
-      // 既存（きれもの等）
+      // counts 既存
       if (WORD_BUTTONS.includes(id)) {
         const userId = interaction.user.id;
         if (interaction.message.id !== userButtonMessages.get(userId)?.id) {
@@ -725,6 +725,7 @@ client.on('interactionCreate', async interaction => {
         const modal = fansModal();
         return interaction.showModal(modal);
       }
+
       // ファン数：自分の記録
       if (id === 'fans:my') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
@@ -740,6 +741,7 @@ client.on('interactionCreate', async interaction => {
           .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
         return interaction.reply({ embeds: [embed], ephemeral: true });
       }
+
       // ★ ファン数：訂正モーダル
       if (id === 'fans:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
@@ -750,11 +752,11 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
-      // ★ 匿名投票 票ボタン
+      // 匿名投票：投票ボタン
       if (id.startsWith('anonpoll:vote:')) {
         const idx = Number(id.split(':')[2] || '0');
         const pollId = interaction.message.id;
-        // 投票状態取得
+
         const { rows } = await pool.query(`SELECT is_closed, multi_allowed FROM anon_polls WHERE poll_id=$1`, [pollId]);
         if (!rows.length) return interaction.reply({ content: '投票データが見つかりません。', ephemeral: true });
         if (rows[0].is_closed) return interaction.reply({ content: 'この投票は締め切られています。', ephemeral: true });
@@ -762,7 +764,7 @@ client.on('interactionCreate', async interaction => {
         const multi = rows[0].multi_allowed;
 
         if (multi) {
-          // 複数選択：トグル（既に同じchoiceがあれば削除、無ければ追加）
+          // 複数選択：トグル
           const exists = await pool.query(
             `SELECT 1 FROM anon_votes WHERE poll_id=$1 AND user_id=$2 AND choice=$3`,
             [pollId, interaction.user.id, idx]
@@ -797,7 +799,7 @@ client.on('interactionCreate', async interaction => {
 
     /* ---------- モーダル ---------- */
     if (interaction.type === InteractionType.ModalSubmit) {
-      // 入力
+      // 通常入力
       if (interaction.customId === 'fans:modal') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -815,7 +817,7 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
         }
 
-        // 減少チェック（通常入力）
+        // 減少チェック
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_ALLOW_DECREASE && value < prev) {
           return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
@@ -850,7 +852,7 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
-        // 訂正は減少も許可（設定）
+        // 設定により減少も許可可
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_EDIT_ALLOW_DECREASE && value < prev) {
           return interaction.reply({ content: `設定により小さい値での訂正は許可されていません。`, ephemeral: true });
@@ -867,14 +869,19 @@ client.on('interactionCreate', async interaction => {
     }
   } catch (err) {
     console.error('interaction error:', err);
-    if (interaction.isRepliable()) {
-      try { await interaction.reply({ content: 'エラーが発生しました。', ephemeral: true }); } catch {}
-    }
+    // isRepliable が true ならエラーメッセージ（ephemeral）
+    try {
+      if ('isRepliable' in interaction && interaction.isRepliable()) {
+        if (!interaction.deferred && !interaction.replied) {
+          await interaction.reply({ content: 'エラーが発生しました。', ephemeral: true });
+        }
+      }
+    } catch {}
   }
 });
 
 /* ==============================
-   定期削除タスク（既存）
+   定期削除タスク（auto_delete）
 ============================== */
 setInterval(async () => {
   try {
