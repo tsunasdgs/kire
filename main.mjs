@@ -61,10 +61,15 @@ const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS 
 
 /* ==============================
    DB 接続
+   ※ 既存機能はそのまま。追加でプール設定を「寝やすい」方向に寄せる
 ============================== */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
+  // ↓追加（機能削除ではなく安定化・節約向けの設定）
+  max: parseInt(process.env.PG_POOL_MAX || '2', 10),
+  idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '10000', 10), // 10s
+  connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10), // 5s
 });
 
 /* ==============================
@@ -89,6 +94,11 @@ async function initDB() {
       channel_id BIGINT NOT NULL,
       delete_at BIGINT NOT NULL
     )
+  `);
+  // ★追加：期限検索のためのINDEX（機能削除なし・DB負荷軽減）
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_auto_delete_messages_delete_at
+      ON auto_delete_messages (delete_at)
   `);
 
   // 既存：ファン数
@@ -209,6 +219,44 @@ function getJstMonthKey(date = new Date()) {
 
 // レート制限メモ（ユーザーごと）
 const fansLastInputAt = new Map();
+
+/* ==============================
+   追加：インタラクションの安全応答（3秒制限対策）
+   ※ 機能削除はせず、DB遅延時でも「失敗」になりにくくする
+============================== */
+function isLikelyDbPausedError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('paused') ||
+    msg.includes('free plan limit') ||
+    msg.includes('monthly') && msg.includes('limit') ||
+    msg.includes('terminating connection') ||
+    msg.includes('connection terminated') ||
+    msg.includes('remaining connection slots') ||
+    msg.includes('timeout') ||
+    msg.includes('etimedout')
+  );
+}
+function dbPausedUserMessage() {
+  return 'DBが停止中/制限到達の可能性があります（Neonの月次上限など）。時間を置くか、DB側の制限を解除してください。';
+}
+async function safeReplyOrEdit(interaction, payload) {
+  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
+  return interaction.reply(payload);
+}
+async function safeDeferReply(interaction, ephemeral = true) {
+  if (interaction.deferred || interaction.replied) return;
+  await interaction.deferReply({ ephemeral }).catch(() => {});
+}
+
+/* ==============================
+   追加：ファン数モーダルのプレフィルキャッシュ
+   ※ ボタン押下でDBを叩かず showModal できるようにして「インタラクション失敗」を回避
+============================== */
+const fansLastSnapshotCache = new Map(); // key: `${guildId}:${userId}` -> number
+const fansMonthBaseCache = new Map();    // key: `${guildId}:${userId}:${monthKey}` -> number
+function keyGU(guildId, userId) { return `${guildId}:${userId}`; }
+function keyGUM(guildId, userId, monthKey) { return `${guildId}:${userId}:${monthKey}`; }
 
 /* ==============================
    DB ヘルパー（既存）
@@ -338,6 +386,9 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
     [guildId, userId, value, source]
   );
 
+  // キャッシュ（直近値）
+  fansLastSnapshotCache.set(keyGU(guildId, userId), Number(value));
+
   // 月次アップサート（JST基準）
   const monthKey = getJstMonthKey();
   const { rows } = await pool.query(
@@ -351,18 +402,26 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
        VALUES ($1,$2,$3,$4,$4,0,1)`,
       [guildId, userId, monthKey, value]
     );
+
+    // キャッシュ（今月のbase）
+    fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(value));
+
     return { monthKey, base: value, last: value, delta: 0, updates: 1 };
   } else {
     const base = Number(rows[0].base_fans);
     const updates = Number(rows[0].updates) + 1;
     const last = value;
-    const delta = Math.max(0, last - base);
+    const delta = Math.max(0, Number(last) - Number(base));
     await pool.query(
       `UPDATE fan_monthly
        SET last_fans=$4, delta_fans=$5, updates=$6, updated_at=now()
        WHERE guild_id=$1 AND user_id=$2 AND month_key=$3`,
       [guildId, userId, monthKey, last, delta, updates]
     );
+
+    // キャッシュ（今月のbaseは変わらないが念のため）
+    fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(base));
+
     return { monthKey, base, last, delta, updates };
   }
 }
@@ -375,6 +434,10 @@ async function fetchMyMonth(guildId, userId, monthKey = getJstMonthKey()) {
   );
   if (!rows.length) return null;
   const r = rows[0];
+
+  // キャッシュ（base）
+  fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(r.base_fans));
+
   return {
     monthKey,
     base: Number(r.base_fans),
@@ -386,11 +449,16 @@ async function fetchMyMonth(guildId, userId, monthKey = getJstMonthKey()) {
 }
 
 async function fetchLastSnapshotValue(guildId, userId) {
+  const cached = fansLastSnapshotCache.get(keyGU(guildId, userId));
+  if (typeof cached === 'number') return cached;
+
   const { rows } = await pool.query(
     `SELECT fans_total FROM fan_snapshots WHERE guild_id=$1 AND user_id=$2 ORDER BY snapshot_ts DESC LIMIT 1`,
     [guildId, userId]
   );
-  return rows.length ? Number(rows[0].fans_total) : null;
+  const v = rows.length ? Number(rows[0].fans_total) : null;
+  if (v !== null) fansLastSnapshotCache.set(keyGU(guildId, userId), Number(v));
+  return v;
 }
 
 // ★ ベース値の直接訂正（今月の fan_monthly.base_fans を上書き）
@@ -407,17 +475,25 @@ async function correctBaseFans(guildId, userId, newBase) {
        VALUES ($1,$2,$3,$4,$4,0,1)`,
       [guildId, userId, monthKey, newBase]
     );
+
+    // キャッシュ（今月のbase）
+    fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
+
     return { monthKey, base: newBase, last: newBase, delta: 0, updates: 1 };
   } else {
     const last = Number(rows[0].last_fans);
     const updates = Number(rows[0].updates) + 1;
-    const delta = Math.max(0, last - newBase);
+    const delta = Math.max(0, Number(last) - Number(newBase));
     await pool.query(
       `UPDATE fan_monthly
        SET base_fans=$4, delta_fans=$5, updates=$6, updated_at=now()
        WHERE guild_id=$1 AND user_id=$2 AND month_key=$3`,
       [guildId, userId, monthKey, newBase, delta, updates]
     );
+
+    // キャッシュ（今月のbase）
+    fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
+
     return { monthKey, base: newBase, last, delta, updates };
   }
 }
@@ -508,10 +584,85 @@ async function registerCommands(applicationId, guilds) {
 }
 
 /* ==============================
+   自動削除：ポーリング廃止（DBを1分ごとに叩かない）
+   既存機能（24h後に削除 + DBに永続化）を一切削らずに実装を変更
+============================== */
+const autoDeleteTimers = new Map(); // message_id(string) -> Timeout
+const MAX_TIMEOUT_MS = 2_147_000_000; // setTimeoutの安全上限（約24.8日）
+
+function clearAutoDeleteTimer(messageId) {
+  const key = String(messageId);
+  if (autoDeleteTimers.has(key)) {
+    clearTimeout(autoDeleteTimers.get(key));
+    autoDeleteTimers.delete(key);
+  }
+}
+
+async function runAutoDelete(messageId, channelId) {
+  try {
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (channel) {
+      const msg = await channel.messages.fetch(messageId).catch(() => null);
+      if (msg) await msg.delete().catch(() => {});
+    }
+  } finally {
+    // 行は必ず消す（メッセージが既に無くてもOK）
+    try {
+      await pool.query('DELETE FROM auto_delete_messages WHERE message_id=$1', [messageId]);
+    } catch (e) {
+      console.error('auto_delete db cleanup error:', e);
+    }
+  }
+}
+
+function scheduleAutoDelete(messageId, channelId, deleteAt) {
+  const mid = String(messageId);
+  const cid = String(channelId);
+  const when = Number(deleteAt);
+
+  clearAutoDeleteTimer(mid);
+
+  const delay = when - Date.now();
+  if (delay <= 0) {
+    // 期限過ぎは即実行（非同期）
+    void runAutoDelete(mid, cid);
+    return;
+  }
+
+  // setTimeout上限に備えて分割（通常24hなのでまず分割されない）
+  const firstDelay = Math.min(delay, MAX_TIMEOUT_MS);
+  const t = setTimeout(() => {
+    const remain = when - Date.now();
+    if (remain > 0) {
+      // まだ先なら再スケジュール
+      scheduleAutoDelete(mid, cid, when);
+      return;
+    }
+    void runAutoDelete(mid, cid);
+  }, firstDelay);
+
+  autoDeleteTimers.set(mid, t);
+}
+
+async function loadAndScheduleAutoDeletes() {
+  // 起動時に1回だけ読み込んで予約（ポーリングしない）
+  const { rows } = await pool.query(
+    'SELECT message_id, channel_id, delete_at FROM auto_delete_messages'
+  );
+  for (const r of rows) {
+    scheduleAutoDelete(String(r.message_id), String(r.channel_id), Number(r.delete_at));
+  }
+}
+
+/* ==============================
    Bot 起動
 ============================== */
 client.once('ready', async () => {
   await initDB();
+
+  // ★追加：自動削除予約の復元（DBにある分をsetTimeoutで再予約）
+  await loadAndScheduleAutoDeletes();
+
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   // スラッシュコマンド登録（参加している全ギルドに）
@@ -601,6 +752,10 @@ client.on('messageCreate', async message => {
         'INSERT INTO auto_delete_messages(message_id, channel_id, delete_at) VALUES($1, $2, $3)',
         [message.id, message.channel.id, deleteAt]
       );
+
+      // ★追加：登録できたら即スケジュール（DBポーリング不要）
+      scheduleAutoDelete(message.id, message.channel.id, deleteAt);
+
     } catch (err) {
       console.error('自動削除メッセージ登録エラー:', err);
     }
@@ -620,7 +775,7 @@ client.on('interactionCreate', async interaction => {
       if (commandName === 'fans') {
         const sub = interaction.options.getSubcommand();
 
-        // チャンネル制約
+        // チャンネル制約（速いのでdefer不要）
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `このコマンドは <#${FANS_CHANNEL_ID}> で使用してください。`, ephemeral: true });
         }
@@ -644,11 +799,14 @@ client.on('interactionCreate', async interaction => {
             }
           }
 
+          // ここからDBに触るのでdefer（3秒制限対策）
+          await safeDeferReply(interaction, true);
+
           // 直近値と減少許可フラグ
           const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
           const allowDecrease = sub === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
           if (prev !== null && !allowDecrease && value < prev) {
-            return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
           }
 
           const result = await insertSnapshotAndUpsertMonthly(
@@ -661,8 +819,8 @@ client.on('interactionCreate', async interaction => {
 
           const embed = new EmbedBuilder()
             .setTitle(sub === 'edit' ? '✏️ 訂正を反映しました（最新値）' : '📈 登録完了')
-            .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
-          return interaction.reply({ embeds: [embed], ephemeral: true });
+            .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+          return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
         }
 
         if (sub === 'base') {
@@ -678,12 +836,15 @@ client.on('interactionCreate', async interaction => {
             }
           }
 
+          // ここからDBに触るのでdefer（3秒制限対策）
+          await safeDeferReply(interaction, true);
+
           // 減少許可（ベース値は理屈上「小さくする」ケースあり）
           const lastSnap = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
           if (lastSnap !== null && !FANS_BASE_EDIT_ALLOW_DECREASE && value > lastSnap) {
             // ベース値 > 最新スナップ となる矛盾を禁止したい場合のチェック（任意）
             // 今回は「許可しない」設定時のみブロック
-            return interaction.reply({ content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。`, ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。`, ephemeral: true });
           }
 
           const result = await correctBaseFans(interaction.guildId, interaction.user.id, value);
@@ -691,21 +852,25 @@ client.on('interactionCreate', async interaction => {
 
           const embed = new EmbedBuilder()
             .setTitle('🧱 ベース値を訂正しました（今月）')
-            .setDescription(`**${result.monthKey} の記録**\nベース(新): ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
-          return interaction.reply({ embeds: [embed], ephemeral: true });
+            .setDescription(`**${result.monthKey} の記録**\nベース(新): ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+          return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
         }
 
         if (sub === 'my') {
           const month = interaction.options.getString('month') || getJstMonthKey();
+
+          // DBに触るのでdefer
+          await safeDeferReply(interaction, true);
+
           const data = await fetchMyMonth(interaction.guildId, interaction.user.id, month);
           if (!data) {
-            return interaction.reply({ content: `${month} の記録はまだありません。`, ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: `${month} の記録はまだありません。`, ephemeral: true });
           }
           const embed = new EmbedBuilder()
             .setTitle('📒 自分の月次記録')
             .setDescription(`**${data.monthKey}**\nベース: ${data.base.toLocaleString()}\n最新: ${data.last.toLocaleString()}\n今月: **+${data.delta.toLocaleString()}**\n更新回数: ${data.updates}`)
             .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
-          return interaction.reply({ embeds: [embed], ephemeral: true });
+          return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
         }
       }
 
@@ -735,6 +900,9 @@ client.on('interactionCreate', async interaction => {
 
           const multi = interaction.options.getBoolean('multi') || false;
 
+          // ここから channel.send + DB があるのでdefer
+          await safeDeferReply(interaction, true);
+
           const embed = buildPollEmbed(q, options, false, multi);
           const components = buildPollButtons(options);
           const msg = await interaction.channel.send({ embeds: [embed], components });
@@ -745,21 +913,25 @@ client.on('interactionCreate', async interaction => {
              VALUES ($1,$2,$3,$4,$5,$6,$7)`,
             [msg.id, interaction.guildId, interaction.channelId, q, options, interaction.user.id, multi]
           );
-          return interaction.reply({ content: '匿名投票を作成しました。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: '匿名投票を作成しました。', ephemeral: true });
         }
 
         if (sub === 'close') {
           const mid = interaction.options.getString('message_id', true);
+
+          // DBが絡むのでdefer
+          await safeDeferReply(interaction, true);
+
           // 取得
           const { rows } = await pool.query(`SELECT created_by, options, is_closed, question, channel_id FROM anon_polls WHERE poll_id=$1`, [mid]);
-          if (!rows.length) return interaction.reply({ content: '指定の投票が見つかりません。', ephemeral: true });
+          if (!rows.length) return safeReplyOrEdit(interaction, { content: '指定の投票が見つかりません。', ephemeral: true });
           const poll = rows[0];
           const isManager = interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages);
           if (interaction.user.id !== poll.created_by && !isManager) {
-            return interaction.reply({ content: 'この投票を締め切る権限がありません。', ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: 'この投票を締め切る権限がありません。', ephemeral: true });
           }
           if (poll.is_closed) {
-            return interaction.reply({ content: 'すでに締め切られています。', ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: 'すでに締め切られています。', ephemeral: true });
           }
 
           // 集計
@@ -779,7 +951,7 @@ client.on('interactionCreate', async interaction => {
             await msg.edit({ embeds: [resultEmbed], components: buildPollButtons(options, true) });
           }
           await pool.query(`UPDATE anon_polls SET is_closed=TRUE WHERE poll_id=$1`, [mid]);
-          return interaction.reply({ content: '投票を締め切りました。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: '投票を締め切りました。', ephemeral: true });
         }
       }
     }
@@ -790,19 +962,22 @@ client.on('interactionCreate', async interaction => {
 
       // 既存（きれもの等）
       if (WORD_BUTTONS.includes(id)) {
+        // DBが絡むのでdefer（ボタンでもOK）
+        await safeDeferReply(interaction, true);
+
         const userId = interaction.user.id;
         if (interaction.message.id !== userButtonMessages.get(userId)?.id) {
-          return interaction.reply({ content: 'これはあなたのボタンではありません。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: 'これはあなたのボタンではありません。', ephemeral: true });
         }
         const userCounts = await loadCount(userId);
         userCounts[id] += 1;
         await saveCount(userId, userCounts);
         await sendOrUpdateButtons(interaction.channel, userId, userCounts);
         const reply = randomReplies[Math.floor(Math.random() * randomReplies.length)];
-        return interaction.reply({ content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**`, ephemeral: true });
+        return safeReplyOrEdit(interaction, { content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**`, ephemeral: true });
       }
 
-      // ファン数：入力
+      // ファン数：入力（showModalなのでDBは触らない）
       if (id === 'fans:set') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -810,49 +985,57 @@ client.on('interactionCreate', async interaction => {
         const modal = fansModal();
         return interaction.showModal(modal);
       }
-      // ファン数：自分の記録
+
+      // ファン数：自分の記録（DB）
       if (id === 'fans:my') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
+
+        await safeDeferReply(interaction, true);
+
         const data = await fetchMyMonth(interaction.guildId, interaction.user.id, getJstMonthKey());
         if (!data) {
-          return interaction.reply({ content: `今月の記録はまだありません。`, ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: `今月の記録はまだありません。`, ephemeral: true });
         }
         const embed = new EmbedBuilder()
           .setTitle('📒 自分の月次記録')
           .setDescription(`**${data.monthKey}**\nベース: ${data.base.toLocaleString()}\n最新: ${data.last.toLocaleString()}\n今月: **+${data.delta.toLocaleString()}**\n更新回数: ${data.updates}`)
           .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+        return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
       }
-      // ファン数：訂正（最新値）
+
+      // ファン数：訂正（最新値）→ showModal優先（DBを触らない）
       if (id === 'fans:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
-        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
-        const modal = fansEditModal(prev !== null ? String(prev) : '');
+        const cachedPrev = fansLastSnapshotCache.get(keyGU(interaction.guildId, interaction.user.id));
+        const modal = fansEditModal(typeof cachedPrev === 'number' ? String(cachedPrev) : '');
         return interaction.showModal(modal);
       }
-      // ★ ファン数：ベース値訂正
+
+      // ★ ファン数：ベース値訂正 → showModal優先（DBを触らない）
       if (id === 'fans:base') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
-        // 現在の月次を読み、既存の base をデフォルトに出す
-        const current = await fetchMyMonth(interaction.guildId, interaction.user.id, getJstMonthKey());
-        const modal = fansBaseModal(current ? String(current.base) : '');
+        const monthKey = getJstMonthKey();
+        const cachedBase = fansMonthBaseCache.get(keyGUM(interaction.guildId, interaction.user.id, monthKey));
+        const modal = fansBaseModal(typeof cachedBase === 'number' ? String(cachedBase) : '');
         return interaction.showModal(modal);
       }
 
-      // ★ 匿名投票 票ボタン
+      // ★ 匿名投票 票ボタン（DB）
       if (id.startsWith('anonpoll:vote:')) {
+        await safeDeferReply(interaction, true);
+
         const idx = Number(id.split(':')[2] || '0');
         const pollId = interaction.message.id;
         // 投票状態取得
         const { rows } = await pool.query(`SELECT is_closed, multi_allowed FROM anon_polls WHERE poll_id=$1`, [pollId]);
-        if (!rows.length) return interaction.reply({ content: '投票データが見つかりません。', ephemeral: true });
-        if (rows[0].is_closed) return interaction.reply({ content: 'この投票は締め切られています。', ephemeral: true });
+        if (!rows.length) return safeReplyOrEdit(interaction, { content: '投票データが見つかりません。', ephemeral: true });
+        if (rows[0].is_closed) return safeReplyOrEdit(interaction, { content: 'この投票は締め切られています。', ephemeral: true });
 
         const multi = rows[0].multi_allowed;
 
@@ -886,7 +1069,7 @@ client.on('interactionCreate', async interaction => {
         // 現在票数（匿名のまま本人に通知）
         const counts = await countPoll(pollId);
         const total = Array.from(counts.values()).reduce((a, b) => a + b, 0);
-        return interaction.reply({ content: `投票を受け付けました（現在の総投票数：${total}）。`, ephemeral: true });
+        return safeReplyOrEdit(interaction, { content: `投票を受け付けました（現在の総投票数：${total}）。`, ephemeral: true });
       }
     }
 
@@ -897,23 +1080,27 @@ client.on('interactionCreate', async interaction => {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
+
+        // ここからDBが絡むのでdefer
+        await safeDeferReply(interaction, true);
+
         const raw = interaction.fields.getTextInputValue('fans:value').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return interaction.reply({ content: '整数の累計ファン数を入力してください。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。', ephemeral: true });
         }
 
         const now = Date.now();
         const last = fansLastInputAt.get(interaction.user.id) || 0;
         if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
           const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-          return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
         }
 
         // 減少チェック（通常入力）
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_ALLOW_DECREASE && value < prev) {
-          return interaction.reply({ content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。`, ephemeral: true });
         }
 
         const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'manual');
@@ -921,8 +1108,8 @@ client.on('interactionCreate', async interaction => {
 
         const embed = new EmbedBuilder()
           .setTitle('📈 登録完了')
-          .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+          .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+        return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
       }
 
       // 訂正（最新値）
@@ -930,10 +1117,13 @@ client.on('interactionCreate', async interaction => {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
+
+        await safeDeferReply(interaction, true);
+
         const raw = interaction.fields.getTextInputValue('fans:value_edit').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return interaction.reply({ content: '整数の累計ファン数を入力してください。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。', ephemeral: true });
         }
 
         const now = Date.now();
@@ -941,14 +1131,14 @@ client.on('interactionCreate', async interaction => {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
           }
         }
 
         // 訂正は減少も許可（設定）
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_EDIT_ALLOW_DECREASE && value < prev) {
-          return interaction.reply({ content: `設定により小さい値での訂正は許可されていません。`, ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: `設定により小さい値での訂正は許可されていません。`, ephemeral: true });
         }
 
         const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'corrected');
@@ -956,8 +1146,8 @@ client.on('interactionCreate', async interaction => {
 
         const embed = new EmbedBuilder()
           .setTitle('✏️ 訂正を反映しました（最新値）')
-          .setDescription(`**${result.monthKey} の記録**\nベース: ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+          .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+        return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
       }
 
       // ★ ベース値訂正（今月）
@@ -965,10 +1155,13 @@ client.on('interactionCreate', async interaction => {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
         }
+
+        await safeDeferReply(interaction, true);
+
         const raw = interaction.fields.getTextInputValue('fans:value_base').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return interaction.reply({ content: '整数のベース値を入力してください。', ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: '整数のベース値を入力してください。', ephemeral: true });
         }
 
         const now = Date.now();
@@ -976,14 +1169,14 @@ client.on('interactionCreate', async interaction => {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return interaction.reply({ content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+            return safeReplyOrEdit(interaction, { content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
           }
         }
 
         // last_fans との関係（禁止設定なら矛盾をブロック）
         const lastSnap = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (lastSnap !== null && !FANS_BASE_EDIT_ALLOW_DECREASE && value > lastSnap) {
-          return interaction.reply({ content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。`, ephemeral: true });
+          return safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。`, ephemeral: true });
         }
 
         const result = await correctBaseFans(interaction.guildId, interaction.user.id, value);
@@ -991,15 +1184,23 @@ client.on('interactionCreate', async interaction => {
 
         const embed = new EmbedBuilder()
           .setTitle('🧱 ベース値を訂正しました（今月）')
-          .setDescription(`**${result.monthKey} の記録**\nベース(新): ${result.base.toLocaleString()}\n最新: ${result.last.toLocaleString()}\n今月: **+${result.delta.toLocaleString()}**\n更新回数: ${result.updates}`);
-        return interaction.reply({ embeds: [embed], ephemeral: true });
+          .setDescription(`**${result.monthKey} の記録**\nベース(新): ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+        return safeReplyOrEdit(interaction, { embeds: [embed], ephemeral: true });
       }
     }
   } catch (err) {
     console.error('interaction error:', err);
+
+    // DB停止/制限系はユーザーに分かる文言で返す（インタラクション失敗を避ける）
+    const msg = isLikelyDbPausedError(err) ? dbPausedUserMessage() : 'エラーが発生しました。';
+
     try {
-      if (typeof interaction?.reply === 'function' && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'エラーが発生しました。', ephemeral: true });
+      if (typeof interaction?.reply === 'function') {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.editReply({ content: msg }).catch(() => {});
+        } else {
+          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+        }
       }
     } catch {}
   }
@@ -1007,28 +1208,10 @@ client.on('interactionCreate', async interaction => {
 
 /* ==============================
    定期削除タスク（既存）
+   ★修正：setIntervalによる1分ポーリングを廃止
+   既存の「自動削除」機能は scheduleAutoDelete/loadAndScheduleAutoDeletes で維持
 ============================== */
-setInterval(async () => {
-  try {
-    const { rows } = await pool.query(
-      'SELECT * FROM auto_delete_messages WHERE delete_at <= $1',
-      [Date.now()]
-    );
-
-    for (const row of rows) {
-      try {
-        const channel = await client.channels.fetch(row.channel_id);
-        if (!channel) continue;
-        const msg = await channel.messages.fetch(row.message_id).catch(() => null);
-        if (msg) await msg.delete().catch(() => {});
-      } finally {
-        await pool.query('DELETE FROM auto_delete_messages WHERE message_id=$1', [row.message_id]);
-      }
-    }
-  } catch (err) {
-    console.error('定期削除エラー:', err);
-  }
-}, 60 * 1000); // 1分ごと
+// （ここにあった setInterval(...) は削除しました）
 
 /* ==============================
    Bot ログイン
