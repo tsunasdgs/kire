@@ -36,8 +36,6 @@ const client = new Client({
 ============================== */
 const COUNT_CHANNEL_ID = process.env.COUNT_CHANNEL_ID;
 const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
-// ※オートデリート機能は削除（ENVが残っていても未使用）
-const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID; // unused
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
 // ★ ファン数UI用チャンネル（単一）
@@ -54,6 +52,11 @@ const FANS_EDIT_BYPASS_RATE = (process.env.FANS_EDIT_BYPASS_RATE || 'true').toLo
 // ★ ベース値訂正用の許可＆バイパス（今月の base_fans を上書き）
 const FANS_BASE_EDIT_ALLOW_DECREASE = (process.env.FANS_BASE_EDIT_ALLOW_DECREASE || 'true').toLowerCase() === 'true';
 const FANS_BASE_EDIT_BYPASS_RATE = (process.env.FANS_BASE_EDIT_BYPASS_RATE || 'true').toLowerCase() === 'true';
+
+// ★ OCR（スクショ読み取り）設定
+const FANS_OCR_ENABLED = (process.env.FANS_OCR_ENABLED || 'true').toLowerCase() === 'true';
+const FANS_OCR_MIN_INTERVAL_SEC = parseInt(process.env.FANS_OCR_MIN_INTERVAL_SEC || '15', 10);
+const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 今回は主に安全策（将来拡張用）
 
 // 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -86,9 +89,6 @@ async function initDB() {
       nickname_changes INTEGER DEFAULT 0
     )
   `);
-
-  // ※オートデリート機能は削除（テーブル作成・利用も行わない）
-  // 以前のテーブルがDBに残っていても害はありませんが、このコードは参照しません。
 
   // 既存：ファン数
   await pool.query(`
@@ -227,6 +227,8 @@ function getJstMonthKey(date = new Date()) {
 
 // レート制限メモ（ユーザーごと）
 const fansLastInputAt = new Map();
+// OCR実行レート制限
+const fansOcrLastRunAt = new Map();
 
 /* ==============================
    Interaction 安全化（3秒制限対策）
@@ -273,6 +275,118 @@ function keyGU(guildId, userId) { return `${guildId}:${userId}`; }
 function keyGUM(guildId, userId, monthKey) { return `${guildId}:${userId}:${monthKey}`; }
 
 /* ==============================
+   ★追加：OCR（スクショから総獲得数を読む）
+   - 依存：tesseract.js, sharp（どちらも動的import）
+   - 起動時には読み込まない（OCR実行時にだけロード）
+============================== */
+let _ocrWorkerPromise = null;
+let _ocrQueue = Promise.resolve();
+
+function queueOcr(taskFn) {
+  const next = _ocrQueue.then(taskFn, taskFn);
+  _ocrQueue = next.catch(() => {});
+  return next;
+}
+
+async function getOcrWorkerEng() {
+  if (_ocrWorkerPromise) return _ocrWorkerPromise;
+
+  _ocrWorkerPromise = (async () => {
+    const mod = await import('tesseract.js');
+    const createWorker = mod.createWorker || mod.default?.createWorker;
+    if (!createWorker) throw new Error('tesseract.js の createWorker が見つかりません');
+
+    const worker = await createWorker({
+      logger: () => {}, // noisyログを抑制
+    });
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+    await worker.setParameters({
+      tessedit_char_whitelist: '0123456789,',
+      preserve_interword_spaces: '1',
+    });
+    return worker;
+  })();
+
+  return _ocrWorkerPromise;
+}
+
+async function preprocessAndOcrNumberFromBuffer(imageBuf) {
+  // sharp は CommonJS/ESM差異があるため動的importで吸収
+  const sharpMod = await import('sharp');
+  const sharp = sharpMod.default || sharpMod;
+
+  const img = sharp(imageBuf, { failOnError: false });
+  const meta = await img.metadata();
+  const w = meta.width || 0;
+  const h = meta.height || 0;
+  if (!w || !h) throw new Error('画像サイズが取得できません');
+
+  // まずは「画面右下（ファンの総獲得数が出る領域）」に寄せてクロップ
+  // ※端末差を考慮し、少し広めに取る
+  const crop = {
+    left: Math.max(0, Math.floor(w * 0.40)),
+    top: Math.max(0, Math.floor(h * 0.70)),
+    width: Math.min(w, Math.floor(w * 0.60)),
+    height: Math.min(h - Math.floor(h * 0.70), Math.floor(h * 0.22)),
+  };
+
+  let region = await img
+    .extract(crop)
+    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) }) // 解像度底上げ
+    .grayscale()
+    .normalize()
+    .threshold(180)
+    .toBuffer();
+
+  const worker = await getOcrWorkerEng();
+  const { data } = await worker.recognize(region);
+  const text = String(data?.text || '');
+
+  // 数字（カンマ区切り）を抽出。最長候補を採用
+  const matches = [...text.matchAll(/(\d[\d,]{4,})/g)].map(m => m[1]).filter(Boolean);
+  if (!matches.length) return { value: null, rawText: text };
+
+  // もっとも桁が多い候補を採用（ファン総獲得数は他の数値より桁が大きい想定）
+  matches.sort((a, b) => (b.replace(/,/g, '').length - a.replace(/,/g, '').length));
+  const picked = matches[0];
+  const digits = picked.replace(/,/g, '');
+  if (!/^\d+$/.test(digits)) return { value: null, rawText: text };
+
+  const bi = BigInt(digits);
+  if (bi > BigInt(Number.MAX_SAFE_INTEGER)) {
+    // 現行ロジックは Number 前提なので、安全のため弾く（必要なら後でBigInt対応拡張）
+    return { value: null, rawText: text, tooLarge: true };
+  }
+
+  return { value: Number(bi), rawText: text };
+}
+
+async function ocrFansTotalFromAttachment(attachment) {
+  if (!attachment?.url) throw new Error('添付URLが取得できません');
+  const ct = String(attachment.contentType || '');
+  const name = String(attachment.name || '');
+
+  const looksImage =
+    ct.startsWith('image/') ||
+    /\.(png|jpg|jpeg|webp|bmp)$/i.test(name);
+
+  if (!looksImage) {
+    throw new Error('画像ファイルではない可能性があります（png/jpg/webp推奨）');
+  }
+
+  const res = await fetch(attachment.url);
+  if (!res.ok) throw new Error(`画像の取得に失敗しました（HTTP ${res.status}）`);
+  const buf = Buffer.from(await res.arrayBuffer());
+
+  // OCRは重いのでキューで直列化
+  return queueOcr(async () => {
+    const out = await preprocessAndOcrNumberFromBuffer(buf);
+    return out;
+  });
+}
+
+/* ==============================
    DB ヘルパー（既存）
 ============================== */
 async function loadCount(userId) {
@@ -282,7 +396,7 @@ async function loadCount(userId) {
 }
 async function saveCount(userId, counts) {
   await pool.query(`
-    INSERT INTO counts(user_id,kiremono,ritaiya,kirenashi,nickname_changes)
+    INSERT INTO counts(user_id,kiremono,ritaiya, kirenashi, nickname_changes)
     VALUES($1,$2,$3,$4,$5)
     ON CONFLICT(user_id) DO UPDATE
     SET kiremono=$2, ritaiya=$3, kirenashi=$4, nickname_changes=$5
@@ -356,13 +470,17 @@ function fansPanel() {
     embeds: [
       new EmbedBuilder()
         .setTitle('📈 ウマ娘 ファン数トラッキング（JST）')
-        .setDescription('月初にベース値を登録し、月途中で最新の**累計ファン数**を入れると今月の増分が分かります。')
+        .setDescription(
+          '月初にベース値を登録し、月途中で最新の**累計ファン数**を入れると今月の増分が分かります。\n' +
+          'スクショからの読み取りは **/fans ocr** を使ってください（進行状況 → ファン → 総獲得数 が写っている画像）。'
+        )
         .setFooter({ text: '入力は本人にのみ見える形で返信します（ephemeral）' })
     ],
     components: [
       new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('fans:set').setLabel('現在の累計ファン数を入力').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId('fans:my').setLabel('自分の記録を見る').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('fans:ocr').setLabel('スクショから読み取る').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('fans:my').setLabel('自分の記録を見る').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('fans:edit').setLabel('前回入力を訂正（最新値）').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('fans:base').setLabel('ベース値を訂正（今月）').setStyle(ButtonStyle.Secondary)
       )
@@ -414,6 +532,25 @@ function fansBaseModal(prevBase = '') {
           .setPlaceholder('例: 2446076025')
           .setRequired(true)
           .setValue(prevBase)
+      )
+    );
+}
+
+// ★OCR結果の修正用モーダル
+function fansOcrFixModal(defaultValue = '', mode = 'set') {
+  const title = mode === 'edit' ? 'OCR修正：訂正（最新値）' : 'OCR修正：登録（通常）';
+  return new ModalBuilder()
+    .setCustomId(`fans:ocr:modal_fix:${mode}:${defaultValue || ''}`)
+    .setTitle(title)
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('fans:ocr_value_fix')
+          .setLabel('累計ファン数（整数）')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('例: 5900831246')
+          .setRequired(true)
+          .setValue(defaultValue || '')
       )
     );
 }
@@ -587,6 +724,8 @@ async function registerCommands(applicationId, guilds) {
     .addSubcommand(sc => sc.setName('ui').setDescription('専用パネルをチャンネルに設置'))
     .addSubcommand(sc => sc.setName('set').setDescription('現在の累計ファン数を登録')
       .addIntegerOption(opt => opt.setName('value').setDescription('累計ファン数').setRequired(true)))
+    .addSubcommand(sc => sc.setName('ocr').setDescription('スクショから「総獲得数」を読み取り登録（ephemeral）')
+      .addAttachmentOption(opt => opt.setName('image').setDescription('進行状況 → ファン → 総獲得数 が写っているスクショ').setRequired(true)))
     .addSubcommand(sc => sc.setName('my').setDescription('自分の月次記録を表示')
       .addStringOption(opt => opt.setName('month').setDescription('YYYY-MM（省略時は今月）')))
     .addSubcommand(sc => sc.setName('edit').setDescription('前回入力の訂正（最新値 / 小さい値も許容）')
@@ -732,8 +871,6 @@ client.on('messageCreate', async message => {
       return;
     }
   }
-
-  // ※オートデリート機能は削除：AUTO_DELETE_CHANNEL_ID の処理も無し
 });
 
 /* ==============================
@@ -757,6 +894,79 @@ client.on('interactionCreate', async interaction => {
           const panel = fansPanel();
           await interaction.channel.send(panel);
           return interaction.reply({ content: 'パネルを設置しました。', ephemeral: true });
+        }
+
+        if (sub === 'ocr') {
+          if (!FANS_OCR_ENABLED) {
+            return interaction.reply({ content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', ephemeral: true });
+          }
+
+          const now = Date.now();
+          const lastRun = fansOcrLastRunAt.get(interaction.user.id) || 0;
+          if (now - lastRun < FANS_OCR_MIN_INTERVAL_SEC * 1000) {
+            const remain = Math.ceil((FANS_OCR_MIN_INTERVAL_SEC * 1000 - (now - lastRun)) / 1000);
+            return interaction.reply({ content: `OCRは連続実行できません。あと${remain}秒お待ちください。`, ephemeral: true });
+          }
+
+          await safeDeferReply(interaction, true);
+
+          const attachment = interaction.options.getAttachment('image', true);
+
+          let out;
+          try {
+            out = await ocrFansTotalFromAttachment(attachment);
+          } catch (e) {
+            const msg = String(e?.message || e);
+            return safeReplyOrEdit(interaction, {
+              content:
+                `OCR処理に失敗しました：${msg}\n` +
+                `（依存が未導入の場合：\`npm i tesseract.js sharp\`）`
+            });
+          }
+
+          if (out?.tooLarge) {
+            return safeReplyOrEdit(interaction, {
+              content:
+                `OCRは数値を検出しましたが、値が大きすぎて安全に扱えません（Number上限超過）。\n` +
+                `この場合は手入力（/fans set かパネルの入力）でお願いします。`
+            });
+          }
+
+          const value = out?.value;
+          if (!Number.isInteger(value) || value < 0) {
+            const raw = String(out?.rawText || '').trim();
+            return safeReplyOrEdit(interaction, {
+              content:
+                `OCRで数値が確定できませんでした。\n` +
+                `スクショは「進行状況 → ファン → 総獲得数」が**右下に大きく**写っているものをお願いします。\n` +
+                (raw ? `\n--- OCR生出力（参考） ---\n${raw.slice(0, 800)}` : '')
+            });
+          }
+
+          // 参考：前回値
+          const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+
+          const embed = new EmbedBuilder()
+            .setTitle('🧾 OCR結果（総獲得数）')
+            .setDescription(
+              `読み取り値: **${Number(value).toLocaleString()}**\n` +
+              `前回: ${prev === null ? '（未登録）' : prev.toLocaleString()}\n\n` +
+              `この値をどう扱いますか？\n` +
+              `- **通常登録**: 記録を追加（設定により減少は拒否）\n` +
+              `- **訂正**: 最新値として上書き扱い（設定により減少も許可）`
+            )
+            .setFooter({ text: `有効期限目安: ${FANS_OCR_PENDING_TTL_SEC}秒（ボタンが無効になったら再実行してください）` });
+
+          const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`fans:ocr:use:set:${value}`).setLabel('この値で通常登録').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`fans:ocr:use:edit:${value}`).setLabel('この値で訂正（最新値）').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`fans:ocr:fix:set:${value}`).setLabel('数値を修正して通常登録').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`fans:ocr:fix:edit:${value}`).setLabel('数値を修正して訂正').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`fans:ocr:cancel`).setLabel('キャンセル').setStyle(ButtonStyle.Danger)
+          );
+
+          fansOcrLastRunAt.set(interaction.user.id, now);
+          return safeReplyOrEdit(interaction, { embeds: [embed], components: [row] });
         }
 
         if (sub === 'set' || sub === 'edit') {
@@ -938,6 +1148,22 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
+      if (id === 'fans:ocr') {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+        if (!FANS_OCR_ENABLED) {
+          return interaction.reply({ content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', ephemeral: true });
+        }
+        return interaction.reply({
+          content:
+            `スクショ読み取りは **/fans ocr** を使います。\n` +
+            `進行状況 → ファン → **総獲得数** が写っているスクショを添付して実行してください。\n` +
+            `（例）/fans ocr 画像: <スクショ>`,
+          ephemeral: true
+        });
+      }
+
       if (id === 'fans:my') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -974,6 +1200,72 @@ client.on('interactionCreate', async interaction => {
         const cachedBase = fansMonthBaseCache.get(keyGUM(interaction.guildId, interaction.user.id, monthKey));
         const modal = fansBaseModal(typeof cachedBase === 'number' ? String(cachedBase) : '');
         return interaction.showModal(modal);
+      }
+
+      // OCRフロー：キャンセル
+      if (id === 'fans:ocr:cancel') {
+        return interaction.reply({ content: 'キャンセルしました。', ephemeral: true });
+      }
+
+      // OCRフロー：修正モーダルを開く
+      if (id.startsWith('fans:ocr:fix:')) {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+        const parts = id.split(':'); // fans ocr fix <mode> <value>
+        const mode = parts[3] || 'set';
+        const value = parts[4] || '';
+        const modal = fansOcrFixModal(String(value), mode === 'edit' ? 'edit' : 'set');
+        return interaction.showModal(modal);
+      }
+
+      // OCRフロー：この値で登録/訂正
+      if (id.startsWith('fans:ocr:use:')) {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+
+        const parts = id.split(':'); // fans ocr use <mode> <value>
+        const mode = parts[3] || 'set';
+        const rawVal = parts[4] || '';
+        const value = Number(String(rawVal).replace(/[,，\s]/g, ''));
+
+        if (!Number.isInteger(value) || value < 0) {
+          return interaction.reply({ content: '値の解釈に失敗しました。/fans ocr をやり直してください。', ephemeral: true });
+        }
+
+        const now = Date.now();
+
+        // set/edit と同じレート制限ルール
+        if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
+          const last = fansLastInputAt.get(interaction.user.id) || 0;
+          if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
+            const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
+            return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+          }
+        }
+
+        await safeDeferReply(interaction, true);
+
+        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+        const allowDecrease = mode === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
+
+        if (prev !== null && !allowDecrease && value < prev) {
+          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。訂正として登録するか、手入力で見直してください。` });
+        }
+
+        const result = await insertSnapshotAndUpsertMonthly(
+          interaction.guildId,
+          interaction.user.id,
+          value,
+          mode === 'edit' ? 'ocr_corrected' : 'ocr'
+        );
+        fansLastInputAt.set(interaction.user.id, now);
+
+        const embed = new EmbedBuilder()
+          .setTitle(mode === 'edit' ? '🧾 OCR訂正を反映しました（最新値）' : '🧾 OCRで登録しました')
+          .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+        return safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
       }
 
       if (id.startsWith('anonpoll:vote:')) {
@@ -1121,6 +1413,54 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('🧱 ベース値を訂正しました（今月）')
           .setDescription(`**${result.monthKey} の記録**\nベース(新): ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
+        return safeReplyOrEdit(interaction, { embeds: [embed] });
+      }
+
+      // OCR修正モーダル
+      if (interaction.customId.startsWith('fans:ocr:modal_fix:')) {
+        if (interaction.channelId !== FANS_CHANNEL_ID) {
+          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+        }
+        await safeDeferReply(interaction, true);
+
+        const parts = interaction.customId.split(':'); // fans ocr modal_fix <mode> <defaultValue?>
+        const mode = parts[3] || 'set';
+
+        const raw = interaction.fields.getTextInputValue('fans:ocr_value_fix').replace(/[,，\s]/g, '');
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < 0) {
+          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+        }
+
+        const now = Date.now();
+
+        // set/edit と同じレート制限ルール
+        if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
+          const last = fansLastInputAt.get(interaction.user.id) || 0;
+          if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
+            const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
+            return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+          }
+        }
+
+        const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
+        const allowDecrease = mode === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
+
+        if (prev !== null && !allowDecrease && value < prev) {
+          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+        }
+
+        const result = await insertSnapshotAndUpsertMonthly(
+          interaction.guildId,
+          interaction.user.id,
+          value,
+          mode === 'edit' ? 'ocr_corrected' : 'ocr'
+        );
+        fansLastInputAt.set(interaction.user.id, now);
+
+        const embed = new EmbedBuilder()
+          .setTitle(mode === 'edit' ? '🧾 OCR修正で訂正を反映しました' : '🧾 OCR修正で登録しました')
+          .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
         return safeReplyOrEdit(interaction, { embeds: [embed] });
       }
     }
