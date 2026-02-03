@@ -36,6 +36,8 @@ const client = new Client({
 ============================== */
 const COUNT_CHANNEL_ID = process.env.COUNT_CHANNEL_ID;
 const NICKNAME_CHANNEL_ID = process.env.NICKNAME_CHANNEL_ID;
+// ※オートデリート機能は削除（ENVが残っていても未使用）
+const AUTO_DELETE_CHANNEL_ID = process.env.AUTO_DELETE_CHANNEL_ID; // unused
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 
 // ★ ファン数UI用チャンネル（単一）
@@ -84,6 +86,9 @@ async function initDB() {
       nickname_changes INTEGER DEFAULT 0
     )
   `);
+
+  // ※オートデリート機能は削除（テーブル作成・利用も行わない）
+  // 以前のテーブルがDBに残っていても害はありませんが、このコードは参照しません。
 
   // 既存：ファン数
   await pool.query(`
@@ -172,20 +177,20 @@ async function initDB() {
     END $$;
   `);
 
-  // ★追加：ニックネ変更前の「サーバーニックネーム」を保存して戻すためのテーブル
+  // ★追加：ニックネ変更前の「サーバーニックネーム」退避（DB保存）
+  // old_nick は NULL 許容（＝サーバーニックなし → setNickname(null) で復元）
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS nickname_backup (
-      guild_id  TEXT NOT NULL,
-      user_id   TEXT NOT NULL,
-      old_nick  TEXT NOT NULL DEFAULT '',
-      had_nick  BOOLEAN NOT NULL DEFAULT FALSE,
-      saved_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CREATE TABLE IF NOT EXISTS nickname_backups (
+      guild_id TEXT NOT NULL,
+      user_id  TEXT NOT NULL,
+      old_nick TEXT,
+      saved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (guild_id, user_id)
     )
   `);
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_nickname_backup_lookup
-      ON nickname_backup (guild_id, user_id)
+    CREATE INDEX IF NOT EXISTS idx_nickname_backups_saved_at
+      ON nickname_backups (saved_at DESC)
   `);
 }
 
@@ -209,10 +214,8 @@ const randomReplies = [
   'フン！',
 ];
 
-function isKireNick(nick) {
-  if (!nick) return false;
-  return /切れ者確率\d+%/.test(String(nick));
-}
+// ニックネーム遊びの「変更後」判定
+const KIREMONO_NICK_RE = /^切れ者確率\d+%$/;
 
 // JSTのYYYY-MMキー
 function getJstMonthKey(date = new Date()) {
@@ -250,6 +253,7 @@ async function safeReplyOrEdit(interaction, payload) {
   if (interaction.deferred || interaction.replied) {
     if (typeof payload === 'string') return interaction.editReply(payload);
     const p = { ...payload };
+    // editReplyではephemeralは使えない（defer/reply時に確定）
     delete p.ephemeral;
     return interaction.editReply(p);
   }
@@ -289,34 +293,31 @@ async function resetAllCounts() {
 }
 
 /* ==============================
-   ★追加：ニックネーム変更前を保存/復元
+   ★追加：ニックネーム退避（DB保存）
 ============================== */
-async function saveNicknameBackup(guildId, userId, oldNickNullable) {
-  const hadNick = oldNickNullable != null;
-  const oldNick = hadNick ? String(oldNickNullable) : '';
+async function upsertNicknameBackup(guildId, userId, oldNick /* string|null */) {
   await pool.query(
     `
-      INSERT INTO nickname_backup (guild_id, user_id, old_nick, had_nick, saved_at)
-      VALUES ($1,$2,$3,$4, now())
-      ON CONFLICT (guild_id, user_id) DO UPDATE
+    INSERT INTO nickname_backups (guild_id, user_id, old_nick)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (guild_id, user_id) DO UPDATE
       SET old_nick = EXCLUDED.old_nick,
-          had_nick = EXCLUDED.had_nick,
           saved_at = now()
     `,
-    [String(guildId), String(userId), oldNick, hadNick]
+    [String(guildId), String(userId), oldNick === undefined ? null : oldNick]
   );
 }
-async function loadNicknameBackup(guildId, userId) {
+async function fetchNicknameBackup(guildId, userId) {
   const { rows } = await pool.query(
-    `SELECT old_nick, had_nick FROM nickname_backup WHERE guild_id=$1 AND user_id=$2`,
+    `SELECT old_nick FROM nickname_backups WHERE guild_id=$1 AND user_id=$2`,
     [String(guildId), String(userId)]
   );
-  if (!rows.length) return null;
-  return { oldNick: String(rows[0].old_nick || ''), hadNick: !!rows[0].had_nick };
+  if (!rows.length) return { exists: false, oldNick: null };
+  return { exists: true, oldNick: rows[0].old_nick === null ? null : String(rows[0].old_nick) };
 }
 async function deleteNicknameBackup(guildId, userId) {
   await pool.query(
-    `DELETE FROM nickname_backup WHERE guild_id=$1 AND user_id=$2`,
+    `DELETE FROM nickname_backups WHERE guild_id=$1 AND user_id=$2`,
     [String(guildId), String(userId)]
   );
 }
@@ -650,22 +651,31 @@ client.on('guildMemberAdd', async member => {
 ============================== */
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
+  if (!message.guildId) return;
   const member = message.member;
+  if (!member) return;
 
   // ニックネ変更チャンネル
   if (NICKNAME_CHANNEL_ID && message.channel.id === NICKNAME_CHANNEL_ID) {
-    // 「切れ者」起動
     if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
       const counts = await loadCount(member.id);
       counts.nickname_changes += 1;
 
-      // ★変更前のサーバーニックネームを保存（“切れ者中”に上書きしない）
-      if (!isKireNick(member.nickname)) {
-        await saveNicknameBackup(message.guild.id, member.id, member.nickname);
-      }
-
       const percent = Math.floor(Math.random() * 121);
       const newNick = `切れ者確率${percent}%`;
+
+      // ★ここが修正ポイント：
+      // 変更前の「サーバーニックネーム（member.nickname）」をDBに退避してから変更する
+      // ただし、すでに「切れ者確率xx%」状態なら退避を上書きしない（意味がない）
+      const currentNick = member.nickname; // string|null
+      if (!KIREMONO_NICK_RE.test(currentNick ?? '')) {
+        try {
+          await upsertNicknameBackup(message.guildId, member.id, currentNick);
+        } catch (e) {
+          console.error('nickname backup upsert error:', e);
+        }
+      }
+
       await member.setNickname(newNick).catch(console.error);
       await saveCount(member.id, counts);
 
@@ -678,33 +688,34 @@ client.on('messageCreate', async message => {
       return;
     }
 
-    // 画像添付で終了 → 変更前サーバーニックネームへ復元
+    // 画像添付（attachments）で「元に戻す」
     if (message.attachments.size > 0) {
-      if (isKireNick(member.nickname)) {
-        const backup = await loadNicknameBackup(message.guild.id, member.id).catch(() => null);
+      let restored = false;
 
-        try {
-          if (backup) {
-            if (backup.hadNick) {
-              await member.setNickname(backup.oldNick).catch(console.error);
-            } else {
-              // 元々ニックネが無かった（null）→ ニックネ解除
-              await member.setNickname(null).catch(console.error);
-            }
-            await deleteNicknameBackup(message.guild.id, member.id).catch(() => {});
-          } else {
-            // バックアップが無い場合：これ以上は確実に戻せないのでニックネ解除を試みる
-            await member.setNickname(null).catch(console.error);
-          }
+      try {
+        const backup = await fetchNicknameBackup(message.guildId, member.id);
 
-          await message.channel.send('**それがお前の答えかい？\nお前の勝ちだ！**');
+        if (backup.exists) {
+          // ★DBに保存してある「変更前サーバーニック」に復元（NULLならサーバーニック解除）
+          await member.setNickname(backup.oldNick).catch(console.error);
+          // 復元したらバックアップは消す（次のゲームに備える）
+          await deleteNicknameBackup(message.guildId, member.id).catch(e => console.error('nickname backup delete error:', e));
+          restored = true;
+        } else if (KIREMONO_NICK_RE.test(member.nickname ?? '')) {
+          // 万一バックアップが無い場合の安全策：サーバーニックを解除して「切れ者確率」から脱出
+          await member.setNickname(null).catch(console.error);
+          restored = true;
+        }
+      } catch (e) {
+        console.error('nickname restore error:', e);
+      }
 
-          if (userButtonMessages.has(member.id)) {
-            await userButtonMessages.get(member.id).delete().catch(console.error);
-            userButtonMessages.delete(member.id);
-          }
-        } catch (e) {
-          console.error('nickname restore error:', e);
+      if (restored) {
+        await message.channel.send('**それがお前の答えかい？\nお前の勝ちだ！**');
+
+        if (userButtonMessages.has(member.id)) {
+          await userButtonMessages.get(member.id).delete().catch(console.error);
+          userButtonMessages.delete(member.id);
         }
       }
     }
@@ -721,6 +732,8 @@ client.on('messageCreate', async message => {
       return;
     }
   }
+
+  // ※オートデリート機能は削除：AUTO_DELETE_CHANNEL_ID の処理も無し
 });
 
 /* ==============================
@@ -1127,18 +1140,6 @@ client.on('interactionCreate', async interaction => {
     } catch {}
   }
 });
-
-/* ==============================
-   終了処理（任意：Render再起動時の後始末）
-============================== */
-async function shutdown(signal) {
-  console.log(`Received ${signal}, shutting down...`);
-  try { await client.destroy(); } catch {}
-  try { await pool.end(); } catch {}
-  process.exit(0);
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
 
 /* ==============================
    Bot ログイン
