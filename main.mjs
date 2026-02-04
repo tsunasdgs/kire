@@ -1,4 +1,4 @@
-// ===== BEGIN main.mjs (1/3) =====
+// === file: main.mjs
 import 'dotenv/config';
 import express from 'express';
 import {
@@ -10,6 +10,16 @@ import {
 } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
+
+/* ==============================
+   安全策：落ちた原因をログに残す（Render再起動ループ対策）
+============================== */
+process.on('unhandledRejection', (err) => {
+  console.error('unhandledRejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+});
 
 /* ==============================
    Express Web Server (Render 用)
@@ -56,23 +66,19 @@ const FANS_BASE_EDIT_BYPASS_RATE = (process.env.FANS_BASE_EDIT_BYPASS_RATE || 't
 // ★ OCR（スクショ読み取り）設定
 const FANS_OCR_ENABLED = (process.env.FANS_OCR_ENABLED || 'true').toLowerCase() === 'true';
 const FANS_OCR_MIN_INTERVAL_SEC = parseInt(process.env.FANS_OCR_MIN_INTERVAL_SEC || '15', 10);
-const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 表示用（将来拡張用）
+const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 安全策（将来拡張用）
 
-// ★ OCR “止まる”対策（追加）
-// 重要：言語データDLの詰まりが原因になるので、取得先を明示できるようにする
-const FANS_OCR_LANG_PATH =
-  process.env.FANS_OCR_LANG_PATH ||
-  'https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng/4.0.0_best_int';
-const FANS_OCR_CACHE_PATH = process.env.FANS_OCR_CACHE_PATH || './.tesscache';
-const FANS_OCR_INIT_TIMEOUT_MS = parseInt(process.env.FANS_OCR_INIT_TIMEOUT_MS || '60000', 10); // worker初期化
-const FANS_OCR_TIMEOUT_MS = parseInt(process.env.FANS_OCR_TIMEOUT_MS || '90000', 10); // OCR全体
-const FANS_OCR_FETCH_TIMEOUT_MS = parseInt(process.env.FANS_OCR_FETCH_TIMEOUT_MS || '20000', 10); // 画像DL
-const OCR_DEBUG = (process.env.OCR_DEBUG || 'false').toLowerCase() === 'true';
+// ★ OCR言語（基本 eng 推奨：数字だけ読むのでこれで十分）
+const FANS_OCR_LANG = (process.env.FANS_OCR_LANG || 'eng').trim();
+// ★ 言語データの置き場所を明示したい時だけ使う（任意）
+const FANS_OCR_LANG_PATH = (process.env.FANS_OCR_LANG_PATH || '').trim();
+// ★ corePath を指定したい時だけ（任意）
+const FANS_OCR_CORE_PATH = (process.env.FANS_OCR_CORE_PATH || '').trim();
 
 // 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 // ★ 匿名投票：最大選択肢数（既定 10 / 最大25）
-const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS || '10', 10) || 10, 25); // Discordは1メッセ最大25ボタン（5x5行）に配慮
+const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS || '10', 10) || 10, 25);
 
 /* ==============================
    DB 接続
@@ -189,7 +195,6 @@ async function initDB() {
   `);
 
   // ★追加：ニックネ変更前の「サーバーニックネーム」退避（DB保存）
-  // old_nick は NULL 許容（＝サーバーニックなし → setNickname(null) で復元）
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nickname_backups (
       guild_id TEXT NOT NULL,
@@ -241,29 +246,6 @@ const fansLastInputAt = new Map();
 // OCR実行レート制限
 const fansOcrLastRunAt = new Map();
 
-// ★追加：Promise タイムアウト（“考え中で止まる”対策の本体）
-function withTimeout(promise, ms, label = 'timeout') {
-  let t;
-  const timeout = new Promise((_, rej) => {
-    t = setTimeout(() => rej(new Error(label)), ms);
-  });
-  return Promise.race([
-    Promise.resolve(promise).finally(() => clearTimeout(t)),
-    timeout,
-  ]);
-}
-
-// ★追加：fetch タイムアウト（画像DLで詰まるのを防ぐ）
-async function fetchWithTimeout(url, ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /* ==============================
    Interaction 安全化（3秒制限対策）
 ============================== */
@@ -289,7 +271,6 @@ async function safeReplyOrEdit(interaction, payload) {
   if (interaction.deferred || interaction.replied) {
     if (typeof payload === 'string') return interaction.editReply(payload);
     const p = { ...payload };
-    // editReplyではephemeralは使えない（defer/reply時に確定）
     delete p.ephemeral;
     return interaction.editReply(p);
   }
@@ -307,13 +288,11 @@ const fansLastSnapshotCache = new Map(); // `${guildId}:${userId}` -> number
 const fansMonthBaseCache = new Map();    // `${guildId}:${userId}:${monthKey}` -> number
 function keyGU(guildId, userId) { return `${guildId}:${userId}`; }
 function keyGUM(guildId, userId, monthKey) { return `${guildId}:${userId}:${monthKey}`; }
-// ===== END main.mjs (1/3) =====
-// ===== BEGIN main.mjs (2/3) =====
+
 /* ==============================
    ★追加：OCR（スクショから総獲得数を読む）
    - 依存：tesseract.js, sharp（どちらも動的import）
    - 起動時には読み込まない（OCR実行時にだけロード）
-   - “考え中で止まる”対策：初期化/解析/画像DLにタイムアウトを付与
 ============================== */
 let _ocrWorkerPromise = null;
 let _ocrQueue = Promise.resolve();
@@ -332,35 +311,36 @@ async function getOcrWorkerEng() {
     const createWorker = mod.createWorker || mod.default?.createWorker;
     if (!createWorker) throw new Error('tesseract.js の createWorker が見つかりません');
 
-    const worker = await createWorker({
-      logger: OCR_DEBUG ? (m) => console.log('[OCR]', m) : () => {},
-      // 言語データ取得先（ここが詰まると“考え中”になりがち）
-      langPath: FANS_OCR_LANG_PATH, // 末尾 / なし推奨
-      cacheMethod: 'write',
-      cachePath: FANS_OCR_CACHE_PATH,
-    });
+    // ★重要：logger のような「関数」を options に入れると
+    // Node の Worker(postMessage)で DataCloneError になり得るため渡さない
+    const options = {};
+    if (FANS_OCR_LANG_PATH) options.langPath = FANS_OCR_LANG_PATH;
+    if (FANS_OCR_CORE_PATH) options.corePath = FANS_OCR_CORE_PATH;
 
-    // 互換性（バージョン差）吸収：load() があるなら呼ぶ
+    const worker = await createWorker(options);
+
+    // 互換性：load がある版だけ呼ぶ
     if (typeof worker.load === 'function') {
-      await withTimeout(worker.load(), FANS_OCR_INIT_TIMEOUT_MS, 'OCR worker.load timeout');
+      await worker.load();
     }
-
-    await withTimeout(worker.loadLanguage('eng'), FANS_OCR_INIT_TIMEOUT_MS, 'OCR loadLanguage timeout');
-    await withTimeout(worker.initialize('eng'), FANS_OCR_INIT_TIMEOUT_MS, 'OCR initialize timeout');
-
+    await worker.loadLanguage(FANS_OCR_LANG);
+    await worker.initialize(FANS_OCR_LANG);
     await worker.setParameters({
       tessedit_char_whitelist: '0123456789,',
       preserve_interword_spaces: '1',
     });
 
     return worker;
-  })();
+  })().catch((err) => {
+    // 失敗したら次回やり直せるようにリセット
+    _ocrWorkerPromise = null;
+    throw err;
+  });
 
   return _ocrWorkerPromise;
 }
 
 async function preprocessAndOcrNumberFromBuffer(imageBuf) {
-  // sharp は CommonJS/ESM差異があるため動的importで吸収
   const sharpMod = await import('sharp');
   const sharp = sharpMod.default || sharpMod;
 
@@ -370,8 +350,7 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
   const h = meta.height || 0;
   if (!w || !h) throw new Error('画像サイズが取得できません');
 
-  // まずは「画面右下（ファンの総獲得数が出る領域）」に寄せてクロップ
-  // ※端末差を考慮し、少し広めに取る
+  // 右下寄りを広めにクロップ
   const crop = {
     left: Math.max(0, Math.floor(w * 0.40)),
     top: Math.max(0, Math.floor(h * 0.70)),
@@ -379,9 +358,9 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
     height: Math.min(h - Math.floor(h * 0.70), Math.floor(h * 0.22)),
   };
 
-  let region = await img
+  const region = await img
     .extract(crop)
-    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) }) // 解像度底上げ
+    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) })
     .grayscale()
     .normalize()
     .threshold(180)
@@ -391,11 +370,9 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
   const { data } = await worker.recognize(region);
   const text = String(data?.text || '');
 
-  // 数字（カンマ区切り）を抽出。最長候補を採用
   const matches = [...text.matchAll(/(\d[\d,]{4,})/g)].map(m => m[1]).filter(Boolean);
   if (!matches.length) return { value: null, rawText: text };
 
-  // もっとも桁が多い候補を採用（ファン総獲得数は他の数値より桁が大きい想定）
   matches.sort((a, b) => (b.replace(/,/g, '').length - a.replace(/,/g, '').length));
   const picked = matches[0];
   const digits = picked.replace(/,/g, '');
@@ -403,7 +380,6 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
 
   const bi = BigInt(digits);
   if (bi > BigInt(Number.MAX_SAFE_INTEGER)) {
-    // 現行ロジックは Number 前提なので、安全のため弾く（必要なら後でBigInt対応拡張）
     return { value: null, rawText: text, tooLarge: true };
   }
 
@@ -423,22 +399,13 @@ async function ocrFansTotalFromAttachment(attachment) {
     throw new Error('画像ファイルではない可能性があります（png/jpg/webp推奨）');
   }
 
-  // 画像DLで詰まるのを防ぐ
-  const res = await withTimeout(
-    fetchWithTimeout(attachment.url, FANS_OCR_FETCH_TIMEOUT_MS),
-    FANS_OCR_FETCH_TIMEOUT_MS + 1000,
-    'OCR image fetch timeout'
-  );
+  const res = await fetch(attachment.url);
   if (!res.ok) throw new Error(`画像の取得に失敗しました（HTTP ${res.status}）`);
   const buf = Buffer.from(await res.arrayBuffer());
 
-  // OCRは重いのでキューで直列化（同時実行でメモリ死ぬのを防ぐ）
   return queueOcr(async () => {
-    return await withTimeout(
-      preprocessAndOcrNumberFromBuffer(buf),
-      FANS_OCR_TIMEOUT_MS,
-      'OCR recognize timeout'
-    );
+    const out = await preprocessAndOcrNumberFromBuffer(buf);
+    return out;
   });
 }
 
@@ -596,7 +563,7 @@ function fansBaseModal(prevBase = '') {
 function fansOcrFixModal(defaultValue = '', mode = 'set') {
   const title = mode === 'edit' ? 'OCR修正：訂正（最新値）' : 'OCR修正：登録（通常）';
   return new ModalBuilder()
-    .setCustomId(`fans:ocr:modal_fix:${mode}:${defaultValue || ''}`)
+    .setCustomId(`fans:ocr:modal_fix:${mode}`)
     .setTitle(title)
     .addComponents(
       new ActionRowBuilder().addComponents(
@@ -636,7 +603,6 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
     );
 
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(value));
-
     return { monthKey, base: value, last: value, delta: 0, updates: 1 };
   } else {
     const base = Number(rows[0].base_fans);
@@ -652,7 +618,6 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
     );
 
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(base));
-
     return { monthKey, base, last, delta, updates };
   }
 }
@@ -706,7 +671,6 @@ async function correctBaseFans(guildId, userId, newBase) {
     );
 
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
-
     return { monthKey, base: newBase, last: newBase, delta: 0, updates: 1 };
   } else {
     const last = Number(rows[0].last_fans);
@@ -721,12 +685,10 @@ async function correctBaseFans(guildId, userId, newBase) {
     );
 
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
-
     return { monthKey, base: newBase, last, delta, updates };
   }
 }
-// ===== END main.mjs (2/3) =====
-// ===== BEGIN main.mjs (3/3) =====
+
 /* ==============================
    匿名投票：UI/ロジック
 ============================== */
@@ -860,8 +822,6 @@ client.on('messageCreate', async message => {
       const percent = Math.floor(Math.random() * 121);
       const newNick = `切れ者確率${percent}%`;
 
-      // 変更前の「サーバーニックネーム（member.nickname）」をDBに退避してから変更
-      // ただし、すでに「切れ者確率xx%」状態なら退避を上書きしない
       const currentNick = member.nickname; // string|null
       if (!KIREMONO_NICK_RE.test(currentNick ?? '')) {
         try {
@@ -891,13 +851,10 @@ client.on('messageCreate', async message => {
         const backup = await fetchNicknameBackup(message.guildId, member.id);
 
         if (backup.exists) {
-          // DBに保存してある「変更前サーバーニック」に復元（NULLならサーバーニック解除）
           await member.setNickname(backup.oldNick).catch(console.error);
-          // 復元したらバックアップは消す
           await deleteNicknameBackup(message.guildId, member.id).catch(e => console.error('nickname backup delete error:', e));
           restored = true;
         } else if (KIREMONO_NICK_RE.test(member.nickname ?? '')) {
-          // バックアップが無い場合の安全策
           await member.setNickname(null).catch(console.error);
           restored = true;
         }
@@ -964,33 +921,24 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply({ content: `OCRは連続実行できません。あと${remain}秒お待ちください。`, ephemeral: true });
           }
 
-          // 先に defer（3秒制限回避）
           await safeDeferReply(interaction, true);
-
-          // ★ここが追加：defer直後に “準備中” を表示して「考え中」を解除
           await safeReplyOrEdit(interaction, {
             content:
               `OCR準備中…（初回は言語データ取得で時間がかかる場合があります）\n` +
-              `うまくいかない場合は env に FANS_OCR_LANG_PATH を設定してください。`
+              (FANS_OCR_LANG_PATH ? `langPath: ${FANS_OCR_LANG_PATH}\n` : `うまくいかない場合は env に FANS_OCR_LANG_PATH を設定してください。\n`)
           });
 
           const attachment = interaction.options.getAttachment('image', true);
 
           let out;
           try {
-            // OCR全体にタイムアウト（無限に考え中にならない）
-            out = await withTimeout(
-              ocrFansTotalFromAttachment(attachment),
-              FANS_OCR_TIMEOUT_MS,
-              'OCR timeout'
-            );
+            out = await ocrFansTotalFromAttachment(attachment);
           } catch (e) {
             const msg = String(e?.message || e);
             return safeReplyOrEdit(interaction, {
               content:
-                `OCR処理に失敗/タイムアウトしました：${msg}\n` +
-                `原因候補：言語データDL詰まり・初回初期化が重い・画像が大きい・依存未導入。\n` +
-                `対策：\`npm i tesseract.js sharp\` / FANS_OCR_LANG_PATH 設定 / OCR_DEBUG=true でログ確認 / 画像をトリミング`
+                `OCR処理に失敗しました：${msg}\n` +
+                `（依存が未導入の場合：\`npm i tesseract.js sharp\`）`
             });
           }
 
@@ -1036,9 +984,7 @@ client.on('interactionCreate', async interaction => {
           );
 
           fansOcrLastRunAt.set(interaction.user.id, now);
-
-          // content を空にして “準備中” を消す
-          return safeReplyOrEdit(interaction, { content: '', embeds: [embed], components: [row] });
+          return safeReplyOrEdit(interaction, { embeds: [embed], components: [row], content: '' });
         }
 
         if (sub === 'set' || sub === 'edit') {
@@ -1253,7 +1199,6 @@ client.on('interactionCreate', async interaction => {
         return safeReplyOrEdit(interaction, { embeds: [embed] });
       }
 
-      // showModal優先（DBを叩かない）
       if (id === 'fans:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -1263,7 +1208,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
-      // showModal優先（DBを叩かない）
       if (id === 'fans:base') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -1274,9 +1218,13 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
-      // OCRフロー：キャンセル
+      // OCRフロー：キャンセル（ボタンを消す）
       if (id === 'fans:ocr:cancel') {
-        return interaction.reply({ content: 'キャンセルしました。', ephemeral: true });
+        try {
+          return await interaction.update({ content: 'キャンセルしました。', embeds: [], components: [] });
+        } catch {
+          return interaction.reply({ content: 'キャンセルしました。', ephemeral: true });
+        }
       }
 
       // OCRフロー：修正モーダルを開く
@@ -1308,7 +1256,6 @@ client.on('interactionCreate', async interaction => {
 
         const now = Date.now();
 
-        // set/edit と同じレート制限ルール
         if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
@@ -1495,7 +1442,7 @@ client.on('interactionCreate', async interaction => {
         }
         await safeDeferReply(interaction, true);
 
-        const parts = interaction.customId.split(':'); // fans ocr modal_fix <mode> <defaultValue?>
+        const parts = interaction.customId.split(':'); // fans ocr modal_fix <mode>
         const mode = parts[3] || 'set';
 
         const raw = interaction.fields.getTextInputValue('fans:ocr_value_fix').replace(/[,，\s]/g, '');
@@ -1506,7 +1453,6 @@ client.on('interactionCreate', async interaction => {
 
         const now = Date.now();
 
-        // set/edit と同じレート制限ルール
         if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
@@ -1533,7 +1479,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle(mode === 'edit' ? '🧾 OCR修正で訂正を反映しました' : '🧾 OCR修正で登録しました')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed] });
+        return safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
       }
     }
   } catch (err) {
@@ -1557,4 +1503,3 @@ client.on('interactionCreate', async interaction => {
    Bot ログイン
 ============================== */
 client.login(process.env.DISCORD_TOKEN);
-// ===== END main.mjs (3/3) =====
