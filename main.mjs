@@ -6,20 +6,11 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   SlashCommandBuilder, REST, Routes,
   ModalBuilder, TextInputBuilder, TextInputStyle,
-  EmbedBuilder, InteractionType, PermissionsBitField
+  EmbedBuilder, InteractionType, PermissionsBitField,
+  MessageFlags,
 } from 'discord.js';
 import pkg from 'pg';
 const { Pool } = pkg;
-
-/* ==============================
-   安全策：落ちた原因をログに残す（Render再起動ループ対策）
-============================== */
-process.on('unhandledRejection', (err) => {
-  console.error('unhandledRejection:', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('uncaughtException:', err);
-});
 
 /* ==============================
    Express Web Server (Render 用)
@@ -66,14 +57,18 @@ const FANS_BASE_EDIT_BYPASS_RATE = (process.env.FANS_BASE_EDIT_BYPASS_RATE || 't
 // ★ OCR（スクショ読み取り）設定
 const FANS_OCR_ENABLED = (process.env.FANS_OCR_ENABLED || 'true').toLowerCase() === 'true';
 const FANS_OCR_MIN_INTERVAL_SEC = parseInt(process.env.FANS_OCR_MIN_INTERVAL_SEC || '15', 10);
-const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 安全策（将来拡張用）
+const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10);
 
-// ★ OCR言語（基本 eng 推奨：数字だけ読むのでこれで十分）
-const FANS_OCR_LANG = (process.env.FANS_OCR_LANG || 'eng').trim();
-// ★ 言語データの置き場所を明示したい時だけ使う（任意）
-const FANS_OCR_LANG_PATH = (process.env.FANS_OCR_LANG_PATH || '').trim();
-// ★ corePath を指定したい時だけ（任意）
-const FANS_OCR_CORE_PATH = (process.env.FANS_OCR_CORE_PATH || '').trim();
+// tesseract.js 言語設定（数字だけ読むので基本 eng でOK）
+const FANS_OCR_LANG = (process.env.FANS_OCR_LANG || 'eng').trim() || 'eng';
+// 言語データを置く場所（オプション）
+// 例: node_modules/@tesseract.js-data など
+const FANS_OCR_LANG_PATH = (process.env.FANS_OCR_LANG_PATH || '').trim() || '';
+// キャッシュ先（オプション）
+const FANS_OCR_CACHE_PATH = (process.env.FANS_OCR_CACHE_PATH || '').trim() || '';
+// tesseract core/worker path（必要な人のみ）
+const FANS_OCR_CORE_PATH = (process.env.FANS_OCR_CORE_PATH || '').trim() || '';
+const FANS_OCR_WORKER_PATH = (process.env.FANS_OCR_WORKER_PATH || '').trim() || '';
 
 // 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -86,17 +81,20 @@ const ANONPOLL_MAX_OPTIONS = Math.min(parseInt(process.env.ANONPOLL_MAX_OPTIONS 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  // 安定化/節約寄り（任意）
   max: parseInt(process.env.PG_POOL_MAX || '2', 10),
-  idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '10000', 10), // 10s
-  connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10), // 5s
+  idleTimeoutMillis: parseInt(process.env.PG_IDLE_TIMEOUT_MS || '10000', 10),
+  connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
+});
+
+// ★ pg の error イベントでプロセスが落ちるのを防ぐ
+pool.on('error', (err) => {
+  console.error('pg pool error:', err);
 });
 
 /* ==============================
    初回起動時に必要テーブルを作成/更新
 ============================== */
 async function initDB() {
-  // 既存：counts
   await pool.query(`
     CREATE TABLE IF NOT EXISTS counts (
       user_id BIGINT PRIMARY KEY,
@@ -107,7 +105,6 @@ async function initDB() {
     )
   `);
 
-  // 既存：ファン数
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_snapshots (
       guild_id TEXT NOT NULL,
@@ -123,11 +120,12 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_fan_snapshots_lookup
       ON fan_snapshots (guild_id, user_id, snapshot_ts DESC)
   `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS fan_monthly (
       guild_id  TEXT NOT NULL,
       user_id   TEXT NOT NULL,
-      month_key TEXT NOT NULL,  -- 'YYYY-MM' (JST基準)
+      month_key TEXT NOT NULL,
       base_fans BIGINT NOT NULL,
       last_fans BIGINT NOT NULL,
       delta_fans BIGINT NOT NULL,
@@ -141,10 +139,9 @@ async function initDB() {
       ON fan_monthly (guild_id, user_id, month_key)
   `);
 
-  // 既存：匿名投票
   await pool.query(`
     CREATE TABLE IF NOT EXISTS anon_polls (
-      poll_id      TEXT PRIMARY KEY,   -- message_id を使う
+      poll_id      TEXT PRIMARY KEY,
       guild_id     TEXT NOT NULL,
       channel_id   TEXT NOT NULL,
       question     TEXT NOT NULL,
@@ -154,7 +151,6 @@ async function initDB() {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
-  // multi_allowed 追加（なければ）
   await pool.query(`ALTER TABLE anon_polls ADD COLUMN IF NOT EXISTS multi_allowed BOOLEAN NOT NULL DEFAULT FALSE`);
 
   await pool.query(`
@@ -165,7 +161,6 @@ async function initDB() {
       voted_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `);
-  // 旧PK -> 新形式 (poll_id,user_id,choice)
   await pool.query(`DO $$
   BEGIN
     IF EXISTS (
@@ -194,7 +189,7 @@ async function initDB() {
     END $$;
   `);
 
-  // ★追加：ニックネ変更前の「サーバーニックネーム」退避（DB保存）
+  // ★ ニックネ変更前のサーバーニック退避
   await pool.query(`
     CREATE TABLE IF NOT EXISTS nickname_backups (
       guild_id TEXT NOT NULL,
@@ -230,20 +225,16 @@ const randomReplies = [
   'フン！',
 ];
 
-// ニックネーム遊びの「変更後」判定
 const KIREMONO_NICK_RE = /^切れ者確率\d+%$/;
 
-// JSTのYYYY-MMキー
 function getJstMonthKey(date = new Date()) {
-  const d = new Date(date.getTime() + 9 * 60 * 60 * 1000); // JST補正
+  const d = new Date(date.getTime() + 9 * 60 * 60 * 1000);
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
   return `${y}-${m}`;
 }
 
-// レート制限メモ（ユーザーごと）
 const fansLastInputAt = new Map();
-// OCR実行レート制限
 const fansOcrLastRunAt = new Map();
 
 /* ==============================
@@ -266,19 +257,68 @@ function dbPausedUserMessage() {
   return 'DBが停止中/制限到達の可能性があります（Neonの月次上限など）。時間を置くか、DB側の制限を解除してください。';
 }
 
-// ★修正ポイント：editReplyに ephemeral を渡さない
-async function safeReplyOrEdit(interaction, payload) {
-  if (interaction.deferred || interaction.replied) {
-    if (typeof payload === 'string') return interaction.editReply(payload);
-    const p = { ...payload };
-    delete p.ephemeral;
-    return interaction.editReply(p);
-  }
-  return interaction.reply(payload);
+// discord API: Ephemeral flag = 64
+const EPHEMERAL_FLAG =
+  (typeof MessageFlags?.Ephemeral === 'number') ? MessageFlags.Ephemeral : 64;
+
+function normalizeReplyPayload(payload) {
+  if (typeof payload === 'string') return payload;
+  if (!payload || typeof payload !== 'object') return payload;
+
+  const p = { ...payload };
+
+  // discord.js 14.22+ は ephemeral ではなく flags 推奨
+  if (p.ephemeral === true && p.flags == null) p.flags = EPHEMERAL_FLAG;
+  delete p.ephemeral;
+
+  return p;
 }
+
+// ★ editReplyに flags/ephemeral は渡さない
+function normalizeEditPayload(payload) {
+  if (typeof payload === 'string') return payload;
+  if (!payload || typeof payload !== 'object') return payload;
+
+  const p = { ...payload };
+  delete p.ephemeral;
+  delete p.flags;
+  return p;
+}
+
+async function safeReplyOrEdit(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      const p = normalizeEditPayload(payload);
+      return await interaction.editReply(p);
+    }
+    const p = normalizeReplyPayload(payload);
+    return await interaction.reply(p);
+  } catch (e) {
+    // 10062: Unknown interaction（期限切れ等）ならここで握りつぶす
+    const code = e?.code;
+    if (code === 10062) return;
+    throw e;
+  }
+}
+
 async function safeDeferReply(interaction, ephemeral = true) {
   if (interaction.deferred || interaction.replied) return;
-  await interaction.deferReply({ ephemeral }).catch(() => {});
+  try {
+    const opts = ephemeral ? { flags: EPHEMERAL_FLAG } : {};
+    await interaction.deferReply(opts);
+  } catch (e) {
+    if (e?.code === 10062) return;
+    throw e;
+  }
+}
+
+async function safeShowModal(interaction, modal) {
+  try {
+    await interaction.showModal(modal);
+  } catch (e) {
+    if (e?.code === 10062) return;
+    throw e;
+  }
 }
 
 /* ==============================
@@ -290,9 +330,9 @@ function keyGU(guildId, userId) { return `${guildId}:${userId}`; }
 function keyGUM(guildId, userId, monthKey) { return `${guildId}:${userId}:${monthKey}`; }
 
 /* ==============================
-   ★追加：OCR（スクショから総獲得数を読む）
-   - 依存：tesseract.js, sharp（どちらも動的import）
-   - 起動時には読み込まない（OCR実行時にだけロード）
+   ★ OCR（スクショから総獲得数を読む）
+   - 依存：tesseract.js, sharp（動的import）
+   - tesseract.js v7 互換（createWorker(langs, oem, opts)）
 ============================== */
 let _ocrWorkerPromise = null;
 let _ocrQueue = Promise.resolve();
@@ -303,44 +343,56 @@ function queueOcr(taskFn) {
   return next;
 }
 
-async function getOcrWorkerEng() {
-  if (_ocrWorkerPromise) return _ocrWorkerPromise;
+async function createOcrWorker() {
+  const mod = await import('tesseract.js');
+  const createWorker =
+    mod.createWorker ||
+    mod.default?.createWorker ||
+    (typeof mod.default === 'function' ? mod.default : null);
 
-  _ocrWorkerPromise = (async () => {
-    const mod = await import('tesseract.js');
-    const createWorker = mod.createWorker || mod.default?.createWorker;
-    if (!createWorker) throw new Error('tesseract.js の createWorker が見つかりません');
+  if (typeof createWorker !== 'function') {
+    throw new Error('tesseract.js の createWorker が見つかりません');
+  }
 
-    // ★重要：logger のような「関数」を options に入れると
-    // Node の Worker(postMessage)で DataCloneError になり得るため渡さない
-    const options = {};
-    if (FANS_OCR_LANG_PATH) options.langPath = FANS_OCR_LANG_PATH;
-    if (FANS_OCR_CORE_PATH) options.corePath = FANS_OCR_CORE_PATH;
+  const opts = {};
+  if (FANS_OCR_LANG_PATH) opts.langPath = FANS_OCR_LANG_PATH;
+  if (FANS_OCR_CACHE_PATH) opts.cachePath = FANS_OCR_CACHE_PATH;
+  if (FANS_OCR_CORE_PATH) opts.corePath = FANS_OCR_CORE_PATH;
+  if (FANS_OCR_WORKER_PATH) opts.workerPath = FANS_OCR_WORKER_PATH;
 
-    const worker = await createWorker(options);
+  // OEM: 1 = LSTM（既定）
+  const oem = 1;
 
-    // 互換性：load がある版だけ呼ぶ
-    if (typeof worker.load === 'function') {
-      await worker.load();
-    }
-    await worker.loadLanguage(FANS_OCR_LANG);
-    await worker.initialize(FANS_OCR_LANG);
+  // v7/v5系: createWorker(langs, oem, opts)
+  // 旧系: createWorker(opts) -> loadLanguage/initialize
+  let worker;
+  try {
+    worker = await createWorker(FANS_OCR_LANG, oem, opts);
+  } catch (e) {
+    worker = await createWorker(opts);
+    if (typeof worker.loadLanguage === 'function') await worker.loadLanguage(FANS_OCR_LANG);
+    if (typeof worker.initialize === 'function') await worker.initialize(FANS_OCR_LANG);
+  }
+
+  try {
     await worker.setParameters({
       tessedit_char_whitelist: '0123456789,',
       preserve_interword_spaces: '1',
+      // 7: single text line（数字1行を想定）
+      tessedit_pageseg_mode: '7',
     });
+  } catch {}
 
-    return worker;
-  })().catch((err) => {
-    // 失敗したら次回やり直せるようにリセット
-    _ocrWorkerPromise = null;
-    throw err;
-  });
+  return worker;
+}
 
+async function getOcrWorker() {
+  if (_ocrWorkerPromise) return _ocrWorkerPromise;
+  _ocrWorkerPromise = createOcrWorker();
   return _ocrWorkerPromise;
 }
 
-async function preprocessAndOcrNumberFromBuffer(imageBuf) {
+async function ocrNumberFromImageBuffer(imageBuf) {
   const sharpMod = await import('sharp');
   const sharp = sharpMod.default || sharpMod;
 
@@ -350,76 +402,98 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
   const h = meta.height || 0;
   if (!w || !h) throw new Error('画像サイズが取得できません');
 
-  // 右下寄りを広めにクロップ
-  const crop = {
+  const worker = await getOcrWorker();
+
+  async function runOnce(extract) {
+    const { data } = await worker.recognize(extract);
+    const text = String(data?.text || '');
+    const matches = [...text.matchAll(/(\d[\d,]{4,})/g)].map(m => m[1]).filter(Boolean);
+    if (!matches.length) return { value: null, rawText: text };
+
+    matches.sort((a, b) => (b.replace(/,/g, '').length - a.replace(/,/g, '').length));
+    const picked = matches[0];
+    const digits = picked.replace(/,/g, '');
+    if (!/^\d+$/.test(digits)) return { value: null, rawText: text };
+
+    const bi = BigInt(digits);
+    if (bi > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return { value: null, rawText: text, tooLarge: true };
+    }
+    return { value: Number(bi), rawText: text };
+  }
+
+  // ① 右下寄り（まずは軽く）
+  const crop1 = {
     left: Math.max(0, Math.floor(w * 0.40)),
     top: Math.max(0, Math.floor(h * 0.70)),
     width: Math.min(w, Math.floor(w * 0.60)),
-    height: Math.min(h - Math.floor(h * 0.70), Math.floor(h * 0.22)),
+    height: Math.min(h - Math.floor(h * 0.70), Math.floor(h * 0.24)),
   };
 
-  const region = await img
-    .extract(crop)
-    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) })
+  const buf1 = await img
+    .clone()
+    .extract(crop1)
+    .resize({ width: Math.max(900, Math.floor(crop1.width * 2)) })
     .grayscale()
     .normalize()
+    .sharpen()
     .threshold(180)
     .toBuffer();
 
-  const worker = await getOcrWorkerEng();
-  const { data } = await worker.recognize(region);
-  const text = String(data?.text || '');
+  let out = await runOnce(buf1);
+  if (out.value != null || out.tooLarge) return out;
 
-  const matches = [...text.matchAll(/(\d[\d,]{4,})/g)].map(m => m[1]).filter(Boolean);
-  if (!matches.length) return { value: null, rawText: text };
+  // ② もう少し広め（右下〜下半分）
+  const crop2 = {
+    left: Math.max(0, Math.floor(w * 0.20)),
+    top: Math.max(0, Math.floor(h * 0.62)),
+    width: Math.min(w, Math.floor(w * 0.80)),
+    height: Math.min(h - Math.floor(h * 0.62), Math.floor(h * 0.32)),
+  };
 
-  matches.sort((a, b) => (b.replace(/,/g, '').length - a.replace(/,/g, '').length));
-  const picked = matches[0];
-  const digits = picked.replace(/,/g, '');
-  if (!/^\d+$/.test(digits)) return { value: null, rawText: text };
+  const buf2 = await img
+    .clone()
+    .extract(crop2)
+    .resize({ width: Math.max(1100, Math.floor(crop2.width * 2)) })
+    .grayscale()
+    .normalize()
+    .sharpen()
+    .threshold(170)
+    .toBuffer();
 
-  const bi = BigInt(digits);
-  if (bi > BigInt(Number.MAX_SAFE_INTEGER)) {
-    return { value: null, rawText: text, tooLarge: true };
-  }
-
-  return { value: Number(bi), rawText: text };
+  out = await runOnce(buf2);
+  return out;
 }
 
 async function ocrFansTotalFromAttachment(attachment) {
   if (!attachment?.url) throw new Error('添付URLが取得できません');
+
   const ct = String(attachment.contentType || '');
   const name = String(attachment.name || '');
 
-  const looksImage =
-    ct.startsWith('image/') ||
-    /\.(png|jpg|jpeg|webp|bmp)$/i.test(name);
-
-  if (!looksImage) {
-    throw new Error('画像ファイルではない可能性があります（png/jpg/webp推奨）');
-  }
+  const looksImage = ct.startsWith('image/') || /\.(png|jpg|jpeg|webp|bmp)$/i.test(name);
+  if (!looksImage) throw new Error('画像ファイルではない可能性があります（png/jpg/webp推奨）');
 
   const res = await fetch(attachment.url);
   if (!res.ok) throw new Error(`画像の取得に失敗しました（HTTP ${res.status}）`);
   const buf = Buffer.from(await res.arrayBuffer());
 
   return queueOcr(async () => {
-    const out = await preprocessAndOcrNumberFromBuffer(buf);
-    return out;
+    return await ocrNumberFromImageBuffer(buf);
   });
 }
 
 /* ==============================
-   DB ヘルパー（既存）
+   DB ヘルパー
 ============================== */
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
-  if (!rows.length) return { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 };
+  if (!rows.length) return { kiremono: 0, ritaiya: 0, kirenashi: 0, nickname_changes: 0 };
   return rows[0];
 }
 async function saveCount(userId, counts) {
   await pool.query(`
-    INSERT INTO counts(user_id,kiremono,ritaiya, kirenashi, nickname_changes)
+    INSERT INTO counts(user_id,kiremono,ritaiya,kirenashi,nickname_changes)
     VALUES($1,$2,$3,$4,$5)
     ON CONFLICT(user_id) DO UPDATE
     SET kiremono=$2, ritaiya=$3, kirenashi=$4, nickname_changes=$5
@@ -430,9 +504,9 @@ async function resetAllCounts() {
 }
 
 /* ==============================
-   ★追加：ニックネーム退避（DB保存）
+   ★ ニックネーム退避（DB保存）
 ============================== */
-async function upsertNicknameBackup(guildId, userId, oldNick /* string|null */) {
+async function upsertNicknameBackup(guildId, userId, oldNick) {
   await pool.query(
     `
     INSERT INTO nickname_backups (guild_id, user_id, old_nick)
@@ -478,10 +552,10 @@ function createButtonRow(userCounts) {
 async function sendOrUpdateButtons(channel, userId, userCounts) {
   const row = createButtonRow(userCounts);
   if (userButtonMessages.has(userId)) {
-    await userButtonMessages.get(userId).edit({ content: '集計ボタン', components: [row] });
+    await userButtonMessages.get(userId).edit({ content: '集計ボタン', components: [row] }).catch(() => {});
   } else {
-    const msg = await channel.send({ content: '集計ボタン', components: [row] });
-    userButtonMessages.set(userId, msg);
+    const msg = await channel.send({ content: '集計ボタン', components: [row] }).catch(() => null);
+    if (msg) userButtonMessages.set(userId, msg);
   }
 }
 
@@ -577,7 +651,6 @@ function fansOcrFixModal(defaultValue = '', mode = 'set') {
       )
     );
 }
-
 /* ==============================
    ファン数：ロジック
 ============================== */
@@ -601,7 +674,6 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
        VALUES ($1,$2,$3,$4,$4,0,1)`,
       [guildId, userId, monthKey, value]
     );
-
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(value));
     return { monthKey, base: value, last: value, delta: 0, updates: 1 };
   } else {
@@ -616,7 +688,6 @@ async function insertSnapshotAndUpsertMonthly(guildId, userId, value, source = '
        WHERE guild_id=$1 AND user_id=$2 AND month_key=$3`,
       [guildId, userId, monthKey, last, delta, updates]
     );
-
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(base));
     return { monthKey, base, last, delta, updates };
   }
@@ -669,7 +740,6 @@ async function correctBaseFans(guildId, userId, newBase) {
        VALUES ($1,$2,$3,$4,$4,0,1)`,
       [guildId, userId, monthKey, newBase]
     );
-
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
     return { monthKey, base: newBase, last: newBase, delta: 0, updates: 1 };
   } else {
@@ -683,7 +753,6 @@ async function correctBaseFans(guildId, userId, newBase) {
        WHERE guild_id=$1 AND user_id=$2 AND month_key=$3`,
       [guildId, userId, monthKey, newBase, delta, updates]
     );
-
     fansMonthBaseCache.set(keyGUM(guildId, userId, monthKey), Number(newBase));
     return { monthKey, base: newBase, last, delta, updates };
   }
@@ -763,8 +832,8 @@ async function registerCommands(applicationId, guilds) {
       .addStringOption(o => o.setName('message_id').setDescription('投票メッセージID').setRequired(true)));
 
   const body = [fans, anonpoll].map(c => c.toJSON());
-
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
   for (const g of guilds) {
     await rest.put(Routes.applicationGuildCommands(applicationId, g.id), { body });
     console.log(`Slash commands registered for guild: ${g.name}`);
@@ -775,13 +844,22 @@ async function registerCommands(applicationId, guilds) {
    Bot 起動
 ============================== */
 client.once('ready', async () => {
-  await initDB();
+  try {
+    await initDB();
+  } catch (e) {
+    console.error('initDB error:', e);
+  }
 
   console.log(`✅ Logged in as ${client.user.tag}`);
 
   const guilds = client.guilds.cache.map(g => g);
-  await registerCommands(client.application.id, guilds);
+  try {
+    await registerCommands(client.application.id, guilds);
+  } catch (e) {
+    console.error('registerCommands error:', e);
+  }
 
+  // パネル自動設置（1回だけ）
   for (const g of guilds) {
     try {
       const ch = await client.channels.fetch(FANS_CHANNEL_ID).catch(() => null);
@@ -800,7 +878,7 @@ client.once('ready', async () => {
 client.on('guildMemberAdd', async member => {
   if (AUTO_ROLE_ID) {
     const role = member.guild.roles.cache.get(AUTO_ROLE_ID);
-    if (role) await member.roles.add(role).catch(console.error);
+    if (role) await member.roles.add(role).catch(() => {});
   }
 });
 
@@ -808,81 +886,75 @@ client.on('guildMemberAdd', async member => {
    メッセージ監視（既存）
 ============================== */
 client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  if (!message.guildId) return;
-  const member = message.member;
-  if (!member) return;
+  try {
+    if (message.author.bot) return;
+    if (!message.guildId) return;
+    const member = message.member;
+    if (!member) return;
 
-  // ニックネ変更チャンネル
-  if (NICKNAME_CHANNEL_ID && message.channel.id === NICKNAME_CHANNEL_ID) {
-    if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
-      const counts = await loadCount(member.id);
-      counts.nickname_changes += 1;
+    // ニックネ変更チャンネル
+    if (NICKNAME_CHANNEL_ID && message.channel.id === NICKNAME_CHANNEL_ID) {
+      if (message.mentions.has(client.user) && message.content.includes('切れ者')) {
+        const counts = await loadCount(member.id);
+        counts.nickname_changes += 1;
 
-      const percent = Math.floor(Math.random() * 121);
-      const newNick = `切れ者確率${percent}%`;
+        const percent = Math.floor(Math.random() * 121);
+        const newNick = `切れ者確率${percent}%`;
 
-      const currentNick = member.nickname; // string|null
-      if (!KIREMONO_NICK_RE.test(currentNick ?? '')) {
-        try {
-          await upsertNicknameBackup(message.guildId, member.id, currentNick);
-        } catch (e) {
-          console.error('nickname backup upsert error:', e);
+        const currentNick = member.nickname; // string|null
+        if (!KIREMONO_NICK_RE.test(currentNick ?? '')) {
+          await upsertNicknameBackup(message.guildId, member.id, currentNick).catch(() => {});
         }
+
+        await member.setNickname(newNick).catch(() => {});
+        await saveCount(member.id, counts);
+
+        await message.channel.send(
+          `**お前は${counts.nickname_changes}回目の入浴だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
+        ).catch(() => {});
+
+        const userCounts = await loadCount(member.id);
+        await sendOrUpdateButtons(message.channel, member.id, userCounts);
+        return;
       }
 
-      await member.setNickname(newNick).catch(console.error);
-      await saveCount(member.id, counts);
+      // 画像添付（attachments）で「元に戻す」
+      if (message.attachments.size > 0) {
+        let restored = false;
 
-      await message.channel.send(
-        `**お前は${counts.nickname_changes}回目の入浴だねぇ。\n今からお前の名は切れ者確率${percent}% だ。\n分かったら返事をするんだ、切れ者確率${percent}%！！\n${randomReplies[Math.floor(Math.random()*randomReplies.length)]}**`
-      );
-
-      const userCounts = await loadCount(member.id);
-      await sendOrUpdateButtons(message.channel, member.id, userCounts);
-      return;
-    }
-
-    // 画像添付（attachments）で「元に戻す」
-    if (message.attachments.size > 0) {
-      let restored = false;
-
-      try {
-        const backup = await fetchNicknameBackup(message.guildId, member.id);
-
+        const backup = await fetchNicknameBackup(message.guildId, member.id).catch(() => ({ exists: false, oldNick: null }));
         if (backup.exists) {
-          await member.setNickname(backup.oldNick).catch(console.error);
-          await deleteNicknameBackup(message.guildId, member.id).catch(e => console.error('nickname backup delete error:', e));
+          await member.setNickname(backup.oldNick).catch(() => {});
+          await deleteNicknameBackup(message.guildId, member.id).catch(() => {});
           restored = true;
         } else if (KIREMONO_NICK_RE.test(member.nickname ?? '')) {
-          await member.setNickname(null).catch(console.error);
+          await member.setNickname(null).catch(() => {});
           restored = true;
         }
-      } catch (e) {
-        console.error('nickname restore error:', e);
-      }
 
-      if (restored) {
-        await message.channel.send('**それがお前の答えかい？\nお前の勝ちだ！**');
-
-        if (userButtonMessages.has(member.id)) {
-          await userButtonMessages.get(member.id).delete().catch(console.error);
-          userButtonMessages.delete(member.id);
+        if (restored) {
+          await message.channel.send('**それがお前の答えかい？\nお前の勝ちだ！**').catch(() => {});
+          if (userButtonMessages.has(member.id)) {
+            await userButtonMessages.get(member.id).delete().catch(() => {});
+            userButtonMessages.delete(member.id);
+          }
         }
       }
     }
-  }
 
-  // 集計リセット（COUNT_CHANNEL_ID）
-  if (COUNT_CHANNEL_ID && message.channel.id === COUNT_CHANNEL_ID) {
-    if (message.mentions.has(client.user) && message.content.includes('バルス')) {
-      await resetAllCounts();
-      for (const [userId, _] of userButtonMessages.entries()) {
-        await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
+    // 集計リセット（COUNT_CHANNEL_ID）
+    if (COUNT_CHANNEL_ID && message.channel.id === COUNT_CHANNEL_ID) {
+      if (message.mentions.has(client.user) && message.content.includes('バルス')) {
+        await resetAllCounts();
+        for (const [userId] of userButtonMessages.entries()) {
+          await sendOrUpdateButtons(message.channel, userId, { kiremono: 0, ritaiya: 0, kirenashi: 0, nickname_changes: 0 });
+        }
+        await message.channel.send('**全員の集計をリセットしました！**').catch(() => {});
+        return;
       }
-      await message.channel.send('**全員の集計をリセットしました！**');
-      return;
     }
+  } catch (e) {
+    console.error('messageCreate error:', e);
   }
 });
 
@@ -900,32 +972,37 @@ client.on('interactionCreate', async interaction => {
         const sub = interaction.options.getSubcommand();
 
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `このコマンドは <#${FANS_CHANNEL_ID}> で使用してください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `このコマンドは <#${FANS_CHANNEL_ID}> で使用してください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
 
         if (sub === 'ui') {
           const panel = fansPanel();
-          await interaction.channel.send(panel);
-          return interaction.reply({ content: 'パネルを設置しました。', ephemeral: true });
+          await interaction.channel.send(panel).catch(() => {});
+          await safeReplyOrEdit(interaction, { content: 'パネルを設置しました。', flags: EPHEMERAL_FLAG });
+          return;
         }
 
         if (sub === 'ocr') {
           if (!FANS_OCR_ENABLED) {
-            return interaction.reply({ content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', ephemeral: true });
+            await safeReplyOrEdit(interaction, { content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', flags: EPHEMERAL_FLAG });
+            return;
           }
 
           const now = Date.now();
           const lastRun = fansOcrLastRunAt.get(interaction.user.id) || 0;
           if (now - lastRun < FANS_OCR_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_OCR_MIN_INTERVAL_SEC * 1000 - (now - lastRun)) / 1000);
-            return interaction.reply({ content: `OCRは連続実行できません。あと${remain}秒お待ちください。`, ephemeral: true });
+            await safeReplyOrEdit(interaction, { content: `OCRは連続実行できません。あと${remain}秒お待ちください。`, flags: EPHEMERAL_FLAG });
+            return;
           }
 
           await safeDeferReply(interaction, true);
+          // ここで「準備中」を明示（defer後なので editReply）
           await safeReplyOrEdit(interaction, {
             content:
-              `OCR準備中…（初回は言語データ取得で時間がかかる場合があります）\n` +
-              (FANS_OCR_LANG_PATH ? `langPath: ${FANS_OCR_LANG_PATH}\n` : `うまくいかない場合は env に FANS_OCR_LANG_PATH を設定してください。\n`)
+              'OCR準備中…（初回は言語データ取得で時間がかかる場合があります）\n' +
+              'うまくいかない場合は env に `FANS_OCR_LANG_PATH` を設定してみてください。'
           });
 
           const attachment = interaction.options.getAttachment('image', true);
@@ -935,33 +1012,35 @@ client.on('interactionCreate', async interaction => {
             out = await ocrFansTotalFromAttachment(attachment);
           } catch (e) {
             const msg = String(e?.message || e);
-            return safeReplyOrEdit(interaction, {
+            await safeReplyOrEdit(interaction, {
               content:
                 `OCR処理に失敗しました：${msg}\n` +
                 `（依存が未導入の場合：\`npm i tesseract.js sharp\`）`
             });
+            return;
           }
 
           if (out?.tooLarge) {
-            return safeReplyOrEdit(interaction, {
+            await safeReplyOrEdit(interaction, {
               content:
                 `OCRは数値を検出しましたが、値が大きすぎて安全に扱えません（Number上限超過）。\n` +
                 `この場合は手入力（/fans set かパネルの入力）でお願いします。`
             });
+            return;
           }
 
           const value = out?.value;
           if (!Number.isInteger(value) || value < 0) {
             const raw = String(out?.rawText || '').trim();
-            return safeReplyOrEdit(interaction, {
+            await safeReplyOrEdit(interaction, {
               content:
                 `OCRで数値が確定できませんでした。\n` +
                 `スクショは「進行状況 → ファン → 総獲得数」が**右下に大きく**写っているものをお願いします。\n` +
                 (raw ? `\n--- OCR生出力（参考） ---\n${raw.slice(0, 800)}` : '')
             });
+            return;
           }
 
-          // 参考：前回値
           const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
 
           const embed = new EmbedBuilder()
@@ -973,7 +1052,7 @@ client.on('interactionCreate', async interaction => {
               `- **通常登録**: 記録を追加（設定により減少は拒否）\n` +
               `- **訂正**: 最新値として上書き扱い（設定により減少も許可）`
             )
-            .setFooter({ text: `有効期限目安: ${FANS_OCR_PENDING_TTL_SEC}秒（ボタンが無効になったら再実行してください）` });
+            .setFooter({ text: `目安: ${FANS_OCR_PENDING_TTL_SEC}秒（ボタンが無効になったら再実行）` });
 
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`fans:ocr:use:set:${value}`).setLabel('この値で通常登録').setStyle(ButtonStyle.Success),
@@ -984,7 +1063,8 @@ client.on('interactionCreate', async interaction => {
           );
 
           fansOcrLastRunAt.set(interaction.user.id, now);
-          return safeReplyOrEdit(interaction, { embeds: [embed], components: [row], content: '' });
+          await safeReplyOrEdit(interaction, { content: '', embeds: [embed], components: [row] });
+          return;
         }
 
         if (sub === 'set' || sub === 'edit') {
@@ -995,7 +1075,8 @@ client.on('interactionCreate', async interaction => {
             const last = fansLastInputAt.get(interaction.user.id) || 0;
             if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
               const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-              return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+              await safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, flags: EPHEMERAL_FLAG });
+              return;
             }
           }
 
@@ -1004,7 +1085,8 @@ client.on('interactionCreate', async interaction => {
           const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
           const allowDecrease = sub === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
           if (prev !== null && !allowDecrease && value < prev) {
-            return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+            await safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+            return;
           }
 
           const result = await insertSnapshotAndUpsertMonthly(
@@ -1018,7 +1100,8 @@ client.on('interactionCreate', async interaction => {
           const embed = new EmbedBuilder()
             .setTitle(sub === 'edit' ? '✏️ 訂正を反映しました（最新値）' : '📈 登録完了')
             .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-          return safeReplyOrEdit(interaction, { embeds: [embed] });
+          await safeReplyOrEdit(interaction, { embeds: [embed] });
+          return;
         }
 
         if (sub === 'base') {
@@ -1029,7 +1112,8 @@ client.on('interactionCreate', async interaction => {
             const last = fansLastInputAt.get(interaction.user.id) || 0;
             if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
               const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-              return interaction.reply({ content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+              await safeReplyOrEdit(interaction, { content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, flags: EPHEMERAL_FLAG });
+              return;
             }
           }
 
@@ -1037,7 +1121,8 @@ client.on('interactionCreate', async interaction => {
 
           const lastSnap = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
           if (lastSnap !== null && !FANS_BASE_EDIT_ALLOW_DECREASE && value > lastSnap) {
-            return safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。` });
+            await safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。` });
+            return;
           }
 
           const result = await correctBaseFans(interaction.guildId, interaction.user.id, value);
@@ -1046,7 +1131,8 @@ client.on('interactionCreate', async interaction => {
           const embed = new EmbedBuilder()
             .setTitle('🧱 ベース値を訂正しました（今月）')
             .setDescription(`**${result.monthKey} の記録**\nベース(新): ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-          return safeReplyOrEdit(interaction, { embeds: [embed] });
+          await safeReplyOrEdit(interaction, { embeds: [embed] });
+          return;
         }
 
         if (sub === 'my') {
@@ -1055,13 +1141,15 @@ client.on('interactionCreate', async interaction => {
 
           const data = await fetchMyMonth(interaction.guildId, interaction.user.id, month);
           if (!data) {
-            return safeReplyOrEdit(interaction, { content: `${month} の記録はまだありません。` });
+            await safeReplyOrEdit(interaction, { content: `${month} の記録はまだありません。` });
+            return;
           }
           const embed = new EmbedBuilder()
             .setTitle('📒 自分の月次記録')
             .setDescription(`**${data.monthKey}**\nベース: ${data.base.toLocaleString()}\n最新: ${data.last.toLocaleString()}\n今月: **+${data.delta.toLocaleString()}**\n更新回数: ${data.updates}`)
             .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
-          return safeReplyOrEdit(interaction, { embeds: [embed] });
+          await safeReplyOrEdit(interaction, { embeds: [embed] });
+          return;
         }
       }
 
@@ -1070,7 +1158,8 @@ client.on('interactionCreate', async interaction => {
         const sub = interaction.options.getSubcommand();
 
         if (ANONPOLL_CHANNEL_IDS.length && !ANONPOLL_CHANNEL_IDS.includes(interaction.channelId)) {
-          return interaction.reply({ content: `このコマンドは許可されたチャンネルでのみ使用できます。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: 'このコマンドは許可されたチャンネルでのみ使用できます。', flags: EPHEMERAL_FLAG });
+          return;
         }
 
         if (sub === 'create') {
@@ -1083,7 +1172,8 @@ client.on('interactionCreate', async interaction => {
             .slice(0, ANONPOLL_MAX_OPTIONS);
 
           if (options.length < 2) {
-            return interaction.reply({ content: `選択肢は2個以上、最大${ANONPOLL_MAX_OPTIONS}個で指定してください。`, ephemeral: true });
+            await safeReplyOrEdit(interaction, { content: `選択肢は2個以上、最大${ANONPOLL_MAX_OPTIONS}個で指定してください。`, flags: EPHEMERAL_FLAG });
+            return;
           }
 
           const multi = interaction.options.getBoolean('multi') || false;
@@ -1099,7 +1189,9 @@ client.on('interactionCreate', async interaction => {
              VALUES ($1,$2,$3,$4,$5,$6,$7)`,
             [msg.id, interaction.guildId, interaction.channelId, q, options, interaction.user.id, multi]
           );
-          return safeReplyOrEdit(interaction, { content: '匿名投票を作成しました。' });
+
+          await safeReplyOrEdit(interaction, { content: '匿名投票を作成しました。' });
+          return;
         }
 
         if (sub === 'close') {
@@ -1107,16 +1199,24 @@ client.on('interactionCreate', async interaction => {
 
           await safeDeferReply(interaction, true);
 
-          const { rows } = await pool.query(`SELECT created_by, options, is_closed, question, channel_id FROM anon_polls WHERE poll_id=$1`, [mid]);
-          if (!rows.length) return safeReplyOrEdit(interaction, { content: '指定の投票が見つかりません。' });
+          const { rows } = await pool.query(
+            `SELECT created_by, options, is_closed, question, channel_id FROM anon_polls WHERE poll_id=$1`,
+            [mid]
+          );
+          if (!rows.length) {
+            await safeReplyOrEdit(interaction, { content: '指定の投票が見つかりません。' });
+            return;
+          }
 
           const poll = rows[0];
           const isManager = interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages);
           if (interaction.user.id !== poll.created_by && !isManager) {
-            return safeReplyOrEdit(interaction, { content: 'この投票を締め切る権限がありません。' });
+            await safeReplyOrEdit(interaction, { content: 'この投票を締め切る権限がありません。' });
+            return;
           }
           if (poll.is_closed) {
-            return safeReplyOrEdit(interaction, { content: 'すでに締め切られています。' });
+            await safeReplyOrEdit(interaction, { content: 'すでに締め切られています。' });
+            return;
           }
 
           const counts = await countPoll(mid);
@@ -1130,11 +1230,14 @@ client.on('interactionCreate', async interaction => {
           let msg = null;
           if (channel) msg = await channel.messages.fetch(mid).catch(() => null);
           if (msg) {
-            const resultEmbed = buildPollEmbed(poll.question, options, true, false).setDescription(`**Q:** ${poll.question}\n\n${lines}`);
-            await msg.edit({ embeds: [resultEmbed], components: buildPollButtons(options, true) });
+            const resultEmbed = buildPollEmbed(poll.question, options, true, false)
+              .setDescription(`**Q:** ${poll.question}\n\n${lines}`);
+            await msg.edit({ embeds: [resultEmbed], components: buildPollButtons(options, true) }).catch(() => {});
           }
+
           await pool.query(`UPDATE anon_polls SET is_closed=TRUE WHERE poll_id=$1`, [mid]);
-          return safeReplyOrEdit(interaction, { content: '投票を締め切りました。' });
+          await safeReplyOrEdit(interaction, { content: '投票を締め切りました。' });
+          return;
         }
       }
     }
@@ -1148,110 +1251,119 @@ client.on('interactionCreate', async interaction => {
 
         const userId = interaction.user.id;
         if (interaction.message.id !== userButtonMessages.get(userId)?.id) {
-          return safeReplyOrEdit(interaction, { content: 'これはあなたのボタンではありません。' });
+          await safeReplyOrEdit(interaction, { content: 'これはあなたのボタンではありません。' });
+          return;
         }
         const userCounts = await loadCount(userId);
         userCounts[id] += 1;
         await saveCount(userId, userCounts);
         await sendOrUpdateButtons(interaction.channel, userId, userCounts);
+
         const reply = randomReplies[Math.floor(Math.random() * randomReplies.length)];
-        return safeReplyOrEdit(interaction, { content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**` });
+        await safeReplyOrEdit(interaction, { content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**` });
+        return;
       }
 
       if (id === 'fans:set') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
-        const modal = fansModal();
-        return interaction.showModal(modal);
+        await safeShowModal(interaction, fansModal());
+        return;
       }
 
       if (id === 'fans:ocr') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         if (!FANS_OCR_ENABLED) {
-          return interaction.reply({ content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: '現在、OCR機能は無効化されています（FANS_OCR_ENABLED=false）。', flags: EPHEMERAL_FLAG });
+          return;
         }
-        return interaction.reply({
+        await safeReplyOrEdit(interaction, {
           content:
             `スクショ読み取りは **/fans ocr** を使います。\n` +
             `進行状況 → ファン → **総獲得数** が写っているスクショを添付して実行してください。\n` +
             `（例）/fans ocr 画像: <スクショ>`,
-          ephemeral: true
+          flags: EPHEMERAL_FLAG
         });
+        return;
       }
 
       if (id === 'fans:my') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         await safeDeferReply(interaction, true);
 
         const data = await fetchMyMonth(interaction.guildId, interaction.user.id, getJstMonthKey());
         if (!data) {
-          return safeReplyOrEdit(interaction, { content: `今月の記録はまだありません。` });
+          await safeReplyOrEdit(interaction, { content: '今月の記録はまだありません。' });
+          return;
         }
         const embed = new EmbedBuilder()
           .setTitle('📒 自分の月次記録')
           .setDescription(`**${data.monthKey}**\nベース: ${data.base.toLocaleString()}\n最新: ${data.last.toLocaleString()}\n今月: **+${data.delta.toLocaleString()}**\n更新回数: ${data.updates}`)
           .setFooter({ text: `最終更新: ${new Date(data.updatedAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` });
-        return safeReplyOrEdit(interaction, { embeds: [embed] });
+        await safeReplyOrEdit(interaction, { embeds: [embed] });
+        return;
       }
 
       if (id === 'fans:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         const cachedPrev = fansLastSnapshotCache.get(keyGU(interaction.guildId, interaction.user.id));
-        const modal = fansEditModal(typeof cachedPrev === 'number' ? String(cachedPrev) : '');
-        return interaction.showModal(modal);
+        await safeShowModal(interaction, fansEditModal(typeof cachedPrev === 'number' ? String(cachedPrev) : ''));
+        return;
       }
 
       if (id === 'fans:base') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         const monthKey = getJstMonthKey();
         const cachedBase = fansMonthBaseCache.get(keyGUM(interaction.guildId, interaction.user.id, monthKey));
-        const modal = fansBaseModal(typeof cachedBase === 'number' ? String(cachedBase) : '');
-        return interaction.showModal(modal);
+        await safeShowModal(interaction, fansBaseModal(typeof cachedBase === 'number' ? String(cachedBase) : ''));
+        return;
       }
 
-      // OCRフロー：キャンセル（ボタンを消す）
       if (id === 'fans:ocr:cancel') {
-        try {
-          return await interaction.update({ content: 'キャンセルしました。', embeds: [], components: [] });
-        } catch {
-          return interaction.reply({ content: 'キャンセルしました。', ephemeral: true });
-        }
+        await safeReplyOrEdit(interaction, { content: 'キャンセルしました。', flags: EPHEMERAL_FLAG });
+        return;
       }
 
-      // OCRフロー：修正モーダルを開く
       if (id.startsWith('fans:ocr:fix:')) {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
-        const parts = id.split(':'); // fans ocr fix <mode> <value>
+        const parts = id.split(':');
         const mode = parts[3] || 'set';
         const value = parts[4] || '';
-        const modal = fansOcrFixModal(String(value), mode === 'edit' ? 'edit' : 'set');
-        return interaction.showModal(modal);
+        await safeShowModal(interaction, fansOcrFixModal(String(value), mode === 'edit' ? 'edit' : 'set'));
+        return;
       }
 
-      // OCRフロー：この値で登録/訂正
       if (id.startsWith('fans:ocr:use:')) {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
 
-        const parts = id.split(':'); // fans ocr use <mode> <value>
+        const parts = id.split(':');
         const mode = parts[3] || 'set';
         const rawVal = parts[4] || '';
         const value = Number(String(rawVal).replace(/[,，\s]/g, ''));
 
         if (!Number.isInteger(value) || value < 0) {
-          return interaction.reply({ content: '値の解釈に失敗しました。/fans ocr をやり直してください。', ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: '値の解釈に失敗しました。/fans ocr をやり直してください。', flags: EPHEMERAL_FLAG });
+          return;
         }
 
         const now = Date.now();
@@ -1260,7 +1372,8 @@ client.on('interactionCreate', async interaction => {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return interaction.reply({ content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, ephemeral: true });
+            await safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。`, flags: EPHEMERAL_FLAG });
+            return;
           }
         }
 
@@ -1270,7 +1383,8 @@ client.on('interactionCreate', async interaction => {
         const allowDecrease = mode === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
 
         if (prev !== null && !allowDecrease && value < prev) {
-          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。訂正として登録するか、手入力で見直してください。` });
+          await safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。訂正として登録するか、手入力で見直してください。` });
+          return;
         }
 
         const result = await insertSnapshotAndUpsertMonthly(
@@ -1284,7 +1398,8 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle(mode === 'edit' ? '🧾 OCR訂正を反映しました（最新値）' : '🧾 OCRで登録しました')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
+        await safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
+        return;
       }
 
       if (id.startsWith('anonpoll:vote:')) {
@@ -1294,8 +1409,14 @@ client.on('interactionCreate', async interaction => {
         const pollId = interaction.message.id;
 
         const { rows } = await pool.query(`SELECT is_closed, multi_allowed FROM anon_polls WHERE poll_id=$1`, [pollId]);
-        if (!rows.length) return safeReplyOrEdit(interaction, { content: '投票データが見つかりません。' });
-        if (rows[0].is_closed) return safeReplyOrEdit(interaction, { content: 'この投票は締め切られています。' });
+        if (!rows.length) {
+          await safeReplyOrEdit(interaction, { content: '投票データが見つかりません。' });
+          return;
+        }
+        if (rows[0].is_closed) {
+          await safeReplyOrEdit(interaction, { content: 'この投票は締め切られています。' });
+          return;
+        }
 
         const multi = rows[0].multi_allowed;
 
@@ -1326,7 +1447,8 @@ client.on('interactionCreate', async interaction => {
 
         const counts = await countPoll(pollId);
         const total = Array.from(counts.values()).reduce((a, b) => a + b, 0);
-        return safeReplyOrEdit(interaction, { content: `投票を受け付けました（現在の総投票数：${total}）。` });
+        await safeReplyOrEdit(interaction, { content: `投票を受け付けました（現在の総投票数：${total}）。` });
+        return;
       }
     }
 
@@ -1334,26 +1456,30 @@ client.on('interactionCreate', async interaction => {
     if (interaction.type === InteractionType.ModalSubmit) {
       if (interaction.customId === 'fans:modal') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         await safeDeferReply(interaction, true);
 
         const raw = interaction.fields.getTextInputValue('fans:value').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          await safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          return;
         }
 
         const now = Date.now();
         const last = fansLastInputAt.get(interaction.user.id) || 0;
         if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
           const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-          return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+          await safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+          return;
         }
 
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_ALLOW_DECREASE && value < prev) {
-          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+          await safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+          return;
         }
 
         const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'manual');
@@ -1362,19 +1488,22 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('📈 登録完了')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed] });
+        await safeReplyOrEdit(interaction, { embeds: [embed] });
+        return;
       }
 
       if (interaction.customId === 'fans:modal_edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         await safeDeferReply(interaction, true);
 
         const raw = interaction.fields.getTextInputValue('fans:value_edit').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          await safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          return;
         }
 
         const now = Date.now();
@@ -1382,13 +1511,15 @@ client.on('interactionCreate', async interaction => {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            await safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            return;
           }
         }
 
         const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (prev !== null && !FANS_EDIT_ALLOW_DECREASE && value < prev) {
-          return safeReplyOrEdit(interaction, { content: `設定により小さい値での訂正は許可されていません。` });
+          await safeReplyOrEdit(interaction, { content: '設定により小さい値での訂正は許可されていません。' });
+          return;
         }
 
         const result = await insertSnapshotAndUpsertMonthly(interaction.guildId, interaction.user.id, value, 'corrected');
@@ -1397,19 +1528,22 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('✏️ 訂正を反映しました（最新値）')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed] });
+        await safeReplyOrEdit(interaction, { embeds: [embed] });
+        return;
       }
 
       if (interaction.customId === 'fans:modal_base') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         await safeDeferReply(interaction, true);
 
         const raw = interaction.fields.getTextInputValue('fans:value_base').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return safeReplyOrEdit(interaction, { content: '整数のベース値を入力してください。' });
+          await safeReplyOrEdit(interaction, { content: '整数のベース値を入力してください。' });
+          return;
         }
 
         const now = Date.now();
@@ -1417,13 +1551,15 @@ client.on('interactionCreate', async interaction => {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return safeReplyOrEdit(interaction, { content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            await safeReplyOrEdit(interaction, { content: `連続操作は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            return;
           }
         }
 
         const lastSnap = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
         if (lastSnap !== null && !FANS_BASE_EDIT_ALLOW_DECREASE && value > lastSnap) {
-          return safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。` });
+          await safeReplyOrEdit(interaction, { content: `現在の最新スナップショット（${lastSnap.toLocaleString()}）より大きいベース値は設定できません。` });
+          return;
         }
 
         const result = await correctBaseFans(interaction.guildId, interaction.user.id, value);
@@ -1432,32 +1568,33 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('🧱 ベース値を訂正しました（今月）')
           .setDescription(`**${result.monthKey} の記録**\nベース(新): ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed] });
+        await safeReplyOrEdit(interaction, { embeds: [embed] });
+        return;
       }
 
-      // OCR修正モーダル
-      if (interaction.customId.startsWith('fans:ocr:modal_fix:')) {
+      if (interaction.customId === 'fans:ocr:modal_fix:set' || interaction.customId === 'fans:ocr:modal_fix:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
-          return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
+          await safeReplyOrEdit(interaction, { content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, flags: EPHEMERAL_FLAG });
+          return;
         }
         await safeDeferReply(interaction, true);
 
-        const parts = interaction.customId.split(':'); // fans ocr modal_fix <mode>
-        const mode = parts[3] || 'set';
+        const mode = interaction.customId.endsWith(':edit') ? 'edit' : 'set';
 
         const raw = interaction.fields.getTextInputValue('fans:ocr_value_fix').replace(/[,，\s]/g, '');
         const value = Number(raw);
         if (!Number.isInteger(value) || value < 0) {
-          return safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          await safeReplyOrEdit(interaction, { content: '整数の累計ファン数を入力してください。' });
+          return;
         }
 
         const now = Date.now();
-
         if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
             const remain = Math.ceil((FANS_MIN_INTERVAL_SEC * 1000 - (now - last)) / 1000);
-            return safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            await safeReplyOrEdit(interaction, { content: `連続入力は${FANS_MIN_INTERVAL_SEC}秒間隔です。あと${remain}秒お待ちください。` });
+            return;
           }
         }
 
@@ -1465,7 +1602,8 @@ client.on('interactionCreate', async interaction => {
         const allowDecrease = mode === 'edit' ? FANS_EDIT_ALLOW_DECREASE : FANS_ALLOW_DECREASE;
 
         if (prev !== null && !allowDecrease && value < prev) {
-          return safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+          await safeReplyOrEdit(interaction, { content: `前回(${prev.toLocaleString()})より小さい値は登録できません。` });
+          return;
         }
 
         const result = await insertSnapshotAndUpsertMonthly(
@@ -1479,22 +1617,19 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle(mode === 'edit' ? '🧾 OCR修正で訂正を反映しました' : '🧾 OCR修正で登録しました')
           .setDescription(`**${result.monthKey} の記録**\nベース: ${Number(result.base).toLocaleString()}\n最新: ${Number(result.last).toLocaleString()}\n今月: **+${Number(result.delta).toLocaleString()}**\n更新回数: ${result.updates}`);
-        return safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
+        await safeReplyOrEdit(interaction, { embeds: [embed] });
+        return;
       }
     }
   } catch (err) {
     console.error('interaction error:', err);
 
-    const msg = isLikelyDbPausedError(err) ? dbPausedUserMessage() : 'エラーが発生しました。';
+    // Unknown interaction は返しようがないので終了
+    if (err?.code === 10062) return;
 
+    const msg = isLikelyDbPausedError(err) ? dbPausedUserMessage() : 'エラーが発生しました。';
     try {
-      if (typeof interaction?.reply === 'function') {
-        if (interaction.deferred || interaction.replied) {
-          await interaction.editReply({ content: msg }).catch(() => {});
-        } else {
-          await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
-        }
-      }
+      await safeReplyOrEdit(interaction, { content: msg, flags: EPHEMERAL_FLAG });
     } catch {}
   }
 });
@@ -1503,3 +1638,13 @@ client.on('interactionCreate', async interaction => {
    Bot ログイン
 ============================== */
 client.login(process.env.DISCORD_TOKEN);
+
+// 終了時の後始末（任意）
+process.on('SIGTERM', async () => {
+  try {
+    const worker = await _ocrWorkerPromise;
+    if (worker?.terminate) await worker.terminate().catch(() => {});
+  } catch {}
+  try { await pool.end().catch(() => {}); } catch {}
+  process.exit(0);
+});
