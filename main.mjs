@@ -1,4 +1,4 @@
-// === file: main.mjs
+// ===== BEGIN main.mjs (PART 1/2) =====
 import 'dotenv/config';
 import express from 'express';
 import {
@@ -56,7 +56,7 @@ const FANS_BASE_EDIT_BYPASS_RATE = (process.env.FANS_BASE_EDIT_BYPASS_RATE || 't
 // ★ OCR（スクショ読み取り）設定
 const FANS_OCR_ENABLED = (process.env.FANS_OCR_ENABLED || 'true').toLowerCase() === 'true';
 const FANS_OCR_MIN_INTERVAL_SEC = parseInt(process.env.FANS_OCR_MIN_INTERVAL_SEC || '15', 10);
-const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 今回は主に安全策（将来拡張用）
+const FANS_OCR_PENDING_TTL_SEC = parseInt(process.env.FANS_OCR_PENDING_TTL_SEC || '600', 10); // 安全策（将来拡張用）
 
 // 匿名投票の許可チャンネル（未指定ならどこでもOK、カンマ区切り）
 const ANONPOLL_CHANNEL_IDS = (process.env.ANONPOLL_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -255,8 +255,7 @@ async function safeReplyOrEdit(interaction, payload) {
   if (interaction.deferred || interaction.replied) {
     if (typeof payload === 'string') return interaction.editReply(payload);
     const p = { ...payload };
-    // editReplyではephemeralは使えない（defer/reply時に確定）
-    delete p.ephemeral;
+    delete p.ephemeral; // editReplyではephemeralは使えない
     return interaction.editReply(p);
   }
   return interaction.reply(payload);
@@ -296,9 +295,7 @@ async function getOcrWorkerEng() {
     const createWorker = mod.createWorker || mod.default?.createWorker;
     if (!createWorker) throw new Error('tesseract.js の createWorker が見つかりません');
 
-    const worker = await createWorker({
-      logger: () => {}, // noisyログを抑制
-    });
+    const worker = await createWorker({ logger: () => {} }); // noisyログを抑制
     await worker.loadLanguage('eng');
     await worker.initialize('eng');
     await worker.setParameters({
@@ -312,7 +309,6 @@ async function getOcrWorkerEng() {
 }
 
 async function preprocessAndOcrNumberFromBuffer(imageBuf) {
-  // sharp は CommonJS/ESM差異があるため動的importで吸収
   const sharpMod = await import('sharp');
   const sharp = sharpMod.default || sharpMod;
 
@@ -322,8 +318,7 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
   const h = meta.height || 0;
   if (!w || !h) throw new Error('画像サイズが取得できません');
 
-  // まずは「画面右下（ファンの総獲得数が出る領域）」に寄せてクロップ
-  // ※端末差を考慮し、少し広めに取る
+  // 画面右下に寄せてクロップ（端末差を考慮し広め）
   const crop = {
     left: Math.max(0, Math.floor(w * 0.40)),
     top: Math.max(0, Math.floor(h * 0.70)),
@@ -331,9 +326,9 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
     height: Math.min(h - Math.floor(h * 0.70), Math.floor(h * 0.22)),
   };
 
-  let region = await img
+  const region = await img
     .extract(crop)
-    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) }) // 解像度底上げ
+    .resize({ width: Math.max(800, Math.floor(crop.width * 2)) })
     .grayscale()
     .normalize()
     .threshold(180)
@@ -343,11 +338,10 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
   const { data } = await worker.recognize(region);
   const text = String(data?.text || '');
 
-  // 数字（カンマ区切り）を抽出。最長候補を採用
+  // 数字（カンマ区切り）候補抽出。最長候補を採用
   const matches = [...text.matchAll(/(\d[\d,]{4,})/g)].map(m => m[1]).filter(Boolean);
   if (!matches.length) return { value: null, rawText: text };
 
-  // もっとも桁が多い候補を採用（ファン総獲得数は他の数値より桁が大きい想定）
   matches.sort((a, b) => (b.replace(/,/g, '').length - a.replace(/,/g, '').length));
   const picked = matches[0];
   const digits = picked.replace(/,/g, '');
@@ -355,7 +349,6 @@ async function preprocessAndOcrNumberFromBuffer(imageBuf) {
 
   const bi = BigInt(digits);
   if (bi > BigInt(Number.MAX_SAFE_INTEGER)) {
-    // 現行ロジックは Number 前提なので、安全のため弾く（必要なら後でBigInt対応拡張）
     return { value: null, rawText: text, tooLarge: true };
   }
 
@@ -375,11 +368,15 @@ async function ocrFansTotalFromAttachment(attachment) {
     throw new Error('画像ファイルではない可能性があります（png/jpg/webp推奨）');
   }
 
+  // Node18+ は fetch がグローバル
+  if (typeof fetch !== 'function') {
+    throw new Error('この実行環境は fetch をサポートしていません（Node18+推奨）');
+  }
+
   const res = await fetch(attachment.url);
   if (!res.ok) throw new Error(`画像の取得に失敗しました（HTTP ${res.status}）`);
   const buf = Buffer.from(await res.arrayBuffer());
 
-  // OCRは重いのでキューで直列化
   return queueOcr(async () => {
     const out = await preprocessAndOcrNumberFromBuffer(buf);
     return out;
@@ -391,12 +388,12 @@ async function ocrFansTotalFromAttachment(attachment) {
 ============================== */
 async function loadCount(userId) {
   const { rows } = await pool.query('SELECT * FROM counts WHERE user_id=$1', [userId]);
-  if (!rows.length) return { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 };
+  if (!rows.length) return { kiremono: 0, ritaiya: 0, kirenashi: 0, nickname_changes: 0 };
   return rows[0];
 }
 async function saveCount(userId, counts) {
   await pool.query(`
-    INSERT INTO counts(user_id,kiremono,ritaiya, kirenashi, nickname_changes)
+    INSERT INTO counts(user_id,kiremono,ritaiya,kirenashi,nickname_changes)
     VALUES($1,$2,$3,$4,$5)
     ON CONFLICT(user_id) DO UPDATE
     SET kiremono=$2, ritaiya=$3, kirenashi=$4, nickname_changes=$5
@@ -751,6 +748,8 @@ async function registerCommands(applicationId, guilds) {
     console.log(`Slash commands registered for guild: ${g.name}`);
   }
 }
+// ===== END main.mjs (PART 1/2) =====
+// ===== BEGIN main.mjs (PART 2/2) =====
 
 /* ==============================
    Bot 起動
@@ -763,6 +762,7 @@ client.once('ready', async () => {
   const guilds = client.guilds.cache.map(g => g);
   await registerCommands(client.application.id, guilds);
 
+  // ファン数パネルを1回だけ設置（該当ギルドの FANS_CHANNEL_ID に送る）
   for (const g of guilds) {
     try {
       const ch = await client.channels.fetch(FANS_CHANNEL_ID).catch(() => null);
@@ -803,9 +803,7 @@ client.on('messageCreate', async message => {
       const percent = Math.floor(Math.random() * 121);
       const newNick = `切れ者確率${percent}%`;
 
-      // ★ここが修正ポイント：
-      // 変更前の「サーバーニックネーム（member.nickname）」をDBに退避してから変更する
-      // ただし、すでに「切れ者確率xx%」状態なら退避を上書きしない（意味がない）
+      // 変更前のサーバーニックをDB退避（すでに切れ者確率なら上書きしない）
       const currentNick = member.nickname; // string|null
       if (!KIREMONO_NICK_RE.test(currentNick ?? '')) {
         try {
@@ -835,13 +833,12 @@ client.on('messageCreate', async message => {
         const backup = await fetchNicknameBackup(message.guildId, member.id);
 
         if (backup.exists) {
-          // ★DBに保存してある「変更前サーバーニック」に復元（NULLならサーバーニック解除）
+          // DBに保存してある「変更前サーバーニック」に復元（NULLならサーバーニック解除）
           await member.setNickname(backup.oldNick).catch(console.error);
-          // 復元したらバックアップは消す（次のゲームに備える）
           await deleteNicknameBackup(message.guildId, member.id).catch(e => console.error('nickname backup delete error:', e));
           restored = true;
         } else if (KIREMONO_NICK_RE.test(member.nickname ?? '')) {
-          // 万一バックアップが無い場合の安全策：サーバーニックを解除して「切れ者確率」から脱出
+          // バックアップ無しの安全策：サーバーニック解除
           await member.setNickname(null).catch(console.error);
           restored = true;
         }
@@ -865,12 +862,14 @@ client.on('messageCreate', async message => {
     if (message.mentions.has(client.user) && message.content.includes('バルス')) {
       await resetAllCounts();
       for (const [userId, _] of userButtonMessages.entries()) {
-        await sendOrUpdateButtons(message.channel, userId, { kiremono:0, ritaiya:0, kirenashi:0, nickname_changes:0 });
+        await sendOrUpdateButtons(message.channel, userId, { kiremono: 0, ritaiya: 0, kirenashi: 0, nickname_changes: 0 });
       }
       await message.channel.send('**全員の集計をリセットしました！**');
       return;
     }
   }
+
+  // ※オートデリート機能は削除済み（ここにも処理なし）
 });
 
 /* ==============================
@@ -943,7 +942,6 @@ client.on('interactionCreate', async interaction => {
             });
           }
 
-          // 参考：前回値
           const prev = await fetchLastSnapshotValue(interaction.guildId, interaction.user.id);
 
           const embed = new EmbedBuilder()
@@ -955,7 +953,7 @@ client.on('interactionCreate', async interaction => {
               `- **通常登録**: 記録を追加（設定により減少は拒否）\n` +
               `- **訂正**: 最新値として上書き扱い（設定により減少も許可）`
             )
-            .setFooter({ text: `有効期限目安: ${FANS_OCR_PENDING_TTL_SEC}秒（ボタンが無効になったら再実行してください）` });
+            .setFooter({ text: `目安TTL: ${FANS_OCR_PENDING_TTL_SEC}秒（ボタンが無効になったら再実行してください）` });
 
           const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`fans:ocr:use:set:${value}`).setLabel('この値で通常登録').setStyle(ButtonStyle.Success),
@@ -1112,7 +1110,8 @@ client.on('interactionCreate', async interaction => {
           let msg = null;
           if (channel) msg = await channel.messages.fetch(mid).catch(() => null);
           if (msg) {
-            const resultEmbed = buildPollEmbed(poll.question, options, true, false).setDescription(`**Q:** ${poll.question}\n\n${lines}`);
+            const resultEmbed = buildPollEmbed(poll.question, options, true, false)
+              .setDescription(`**Q:** ${poll.question}\n\n${lines}`);
             await msg.edit({ embeds: [resultEmbed], components: buildPollButtons(options, true) });
           }
           await pool.query(`UPDATE anon_polls SET is_closed=TRUE WHERE poll_id=$1`, [mid]);
@@ -1125,6 +1124,7 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
       const id = interaction.customId;
 
+      // 既存：集計ボタン
       if (WORD_BUTTONS.includes(id)) {
         await safeDeferReply(interaction, true);
 
@@ -1140,6 +1140,7 @@ client.on('interactionCreate', async interaction => {
         return safeReplyOrEdit(interaction, { content: `**${BUTTON_LABELS[id]} ${userCounts[id]}回目！ ${reply}**` });
       }
 
+      // fans UI
       if (id === 'fans:set') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -1181,7 +1182,6 @@ client.on('interactionCreate', async interaction => {
         return safeReplyOrEdit(interaction, { embeds: [embed] });
       }
 
-      // showModal優先（DBを叩かない）
       if (id === 'fans:edit') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -1191,7 +1191,6 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
-      // showModal優先（DBを叩かない）
       if (id === 'fans:base') {
         if (interaction.channelId !== FANS_CHANNEL_ID) {
           return interaction.reply({ content: `この操作は <#${FANS_CHANNEL_ID}> で行ってください。`, ephemeral: true });
@@ -1236,7 +1235,6 @@ client.on('interactionCreate', async interaction => {
 
         const now = Date.now();
 
-        // set/edit と同じレート制限ルール
         if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
@@ -1268,6 +1266,7 @@ client.on('interactionCreate', async interaction => {
         return safeReplyOrEdit(interaction, { embeds: [embed], components: [] });
       }
 
+      // 匿名投票：投票
       if (id.startsWith('anonpoll:vote:')) {
         await safeDeferReply(interaction, true);
 
@@ -1434,7 +1433,6 @@ client.on('interactionCreate', async interaction => {
 
         const now = Date.now();
 
-        // set/edit と同じレート制限ルール
         if (!(mode === 'edit' && FANS_EDIT_BYPASS_RATE)) {
           const last = fansLastInputAt.get(interaction.user.id) || 0;
           if (now - last < FANS_MIN_INTERVAL_SEC * 1000) {
@@ -1485,3 +1483,5 @@ client.on('interactionCreate', async interaction => {
    Bot ログイン
 ============================== */
 client.login(process.env.DISCORD_TOKEN);
+
+// ===== END main.mjs (PART 2/2) =====
